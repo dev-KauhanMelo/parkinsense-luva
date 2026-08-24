@@ -91,19 +91,28 @@ específicas:
 O resultado sai direto em **g**, com significado físico. Dispara a terapia
 quando os dois critérios são satisfeitos ao mesmo tempo:
 
-- **amplitude** `|T| ≥ 0,08 g` — equivale a um tremor de ~0,8 mm a 5 Hz.
+- **força** `|T| ≥ 0,08 g` — equivale a um tremor de ~0,8 mm a 5 Hz.
   É este critério que barra movimento voluntário lento.
-- **dominância** `≥ 0,50` — a faixa de tremor precisa ao menos empatar com a de
-  movimento voluntário. É este que barra gesto rápido perto da faixa de tremor.
+- **pureza** (dominância) `≥ 0,50` — a faixa de tremor precisa ao menos empatar
+  com a de movimento voluntário. É este que barra gesto rápido perto da faixa.
+- **nitidez** `≥ 3,50` — o pico da faixa dividido pela média da faixa. Tremor é
+  uma oscilação sustentada: toda a energia cai numa frequência só. Impacto
+  (digitar, passos, batida na mesa) espalha energia pela faixa inteira.
+  Medido em simulação: tremor sustentado de 4 a 6 Hz dá 4,6 de forma estável,
+  digitar com jitter humano dá 2,2 e batidas na mesa dão 2,4.
 
-Os dois valores são publicados na serial, e o painel do Processing mostra qual
-dos dois está barrando. Sacudir a mão no ar costuma passar de sobra na
+Este terceiro critério existe por um motivo concreto: **digitar são ~5 batidas
+por segundo, ou seja 5 Hz — bem no meio da faixa de tremor.** Sem ele, digitar
+no teclado aciona a terapia.
+
+Os três valores são publicados na serial, e o painel do Processing mostra qual
+deles está barrando. Sacudir a mão no ar costuma passar de sobra na
 amplitude e falhar na dominância: o punho gira junto, e o giro redistribui a
 gravidade pela faixa de 0,5–3 Hz. Com a mão apoiada, como num paciente em
 repouso, isso praticamente não acontece.
 
-Os dois limiares ficam num bloco comentado no topo do `.ino`, com a explicação
-de para que serve cada um.
+Os três limiares ficam num bloco comentado no topo do `.ino`, com a explicação
+de para que serve cada um e o que acontece ao mexer.
 
 A decisão usa o **módulo dos três eixos**, não eixo a eixo: um tremor de 0,07 g
 em cada eixo tem módulo real de 0,12 g e não pode ser descartado três vezes.
@@ -158,7 +167,7 @@ junto. Fora da terapia todos ficam apagados.
 115200 baud, uma linha por amostra (50 Hz), 7 campos separados por vírgula:
 
 ```
-roll,pitch,tX,tY,tZ,tTotal,terapia,dominancia
+roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez
 ```
 
 | Campo | Unidade | Descrição |
@@ -166,21 +175,28 @@ roll,pitch,tX,tY,tZ,tTotal,terapia,dominancia
 | `roll`, `pitch` | graus | inclinação (filtro complementar) — só telemetria |
 | `tX`, `tY`, `tZ` | g | amplitude do tremor em cada **eixo do acelerômetro** |
 | `tTotal` | g | módulo dos três eixos; é ele que aciona a terapia |
-| `terapia` | 0/1 | 1 enquanto o padrão CR está rodando |
+| `estado` | 0/1/2 | 0 = medindo (ao vivo), 1 = terapia, 2 = janela enchendo |
 | `dominancia` | 0–1 | fração da energia na faixa de tremor (2º critério) |
+| `nitidez` | ≥0 | pico da faixa ÷ média da faixa (3º critério) |
+
+O **estado 2** existe porque, logo depois de uma sessão de terapia, o firmware
+descarta a janela e leva 2,56 s para enchê-la de novo. Nesse intervalo os
+valores publicados ainda são os da análise anterior. Sem esse aviso o painel
+exibia a medida velha como se fosse ao vivo e anunciava "TREMOR DETECTADO" com
+a mão parada.
 
 Dois detalhes que confundem quem lê pela primeira vez:
 
 - **`tX`/`tY`/`tZ` são eixos, não dedos.** A luva tem um MPU só: mede a mão
   inteira e não tem como saber qual dedo está tremendo.
-- **Amplitude alta não significa disparo.** A terapia só liga com os dois
-  critérios satisfeitos; `dominancia` diz se o segundo passou.
+- **Força alta não significa disparo.** A terapia só liga com os três critérios
+  satisfeitos ao mesmo tempo.
 - **Durante a terapia os valores ficam congelados** no último medido, por causa
   do blanking descrito acima. O campo `terapia` diz quando isso está valendo.
 
 No boot o firmware também imprime mensagens de diagnóstico que **não** seguem
 esse formato (teste sequencial, offsets de calibração, erros de I2C). Qualquer
-consumidor deve descartar linhas com menos de 8 campos.
+consumidor deve descartar linhas com menos de 9 campos.
 
 Ligando `DIAGNOSTICO = true` no topo do `.ino`, a telemetria dá lugar a uma
 linha por análise dizendo os valores medidos e qual critério barrou — útil no
@@ -241,6 +257,11 @@ por dedo exigiria um sensor por dedo.
 
 **Latência de resposta.** Da parada do tremor até a terapia soltar passa-se o
 bloco em curso (até 6,7 s) mais o reenchimento da janela (2,56 s).
+
+**Movimento rítmico na faixa de tremor.** O critério de nitidez separa impacto
+de oscilação, mas um movimento voluntário *sustentado e regular* entre 3,5 e
+7 Hz é indistinguível de tremor para um acelerômetro. Não há como resolver isso
+sem outro sinal (EMG, por exemplo).
 
 **Sem validação clínica.** Os parâmetros vieram da literatura e de simulação. A
 eficácia real não foi medida.

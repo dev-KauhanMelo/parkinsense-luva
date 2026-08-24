@@ -70,8 +70,21 @@ const int   CALIB_TENTATIVAS  = 3;
 //   seja, o limiar antigo atrapalhava o teste de bancada, não o uso real.
 //   Conferido: nenhum movimento voluntário testado passa de 0,45 de
 //   dominância, então 0,50 continua com margem.
+//
+// NITIDEZ_MIN  quão CONCENTRADO é o tremor numa única frequência.
+//   Razão entre o pico da faixa 3,5-7 Hz e a média dessa mesma faixa.
+//   Tremor é uma oscilação sustentada: toda a energia cai numa frequência só,
+//   e a razão fica alta. Digitar, passos e batidas na mesa são IMPACTOS: cada
+//   golpe espalha energia por toda a faixa, e a razão cai.
+//   Medido em simulação: tremor sustentado de 4 a 6 Hz dá 4,6 de forma bem
+//   estável; digitar com o jitter natural de quem digita dá 2,2, batidas na
+//   mesa dão 2,4. Daí o limiar em 3,5, no meio dos dois grupos.
+//   Este critério existe porque digitar são ~5 batidas por segundo — 5 Hz,
+//   bem no meio da faixa de tremor. Sem ele, digitar aciona a terapia.
+//   Diminuir -> aceita tremor mais irregular, e também impactos.
 const float TREMOR_MIN_G   = 0.08;
 const float DOMINANCE_MIN  = 0.50;
+const float NITIDEZ_MIN    = 3.50;
 
 // Modo diagnóstico: em vez da telemetria CSV, imprime uma linha por análise
 // dizendo os dois valores medidos e QUAL critério barrou. Use com o Monitor
@@ -123,8 +136,11 @@ float offsetGX = 0, offsetGY = 0;   // bias do giroscópio, em graus/s
 
 // Valores de tremor (amplitude em g da frequência dominante) persistem entre ciclos
 float tX = 0, tY = 0, tZ = 0, tTotal = 0;
-// Última análise, guardada para o modo diagnóstico
-float ultVolTotal = 0, ultDominancia = 0;
+// Última análise, publicada na telemetria e usada no modo diagnóstico
+float ultVolTotal = 0, ultDominancia = 0, ultNitidez = 0;
+// false enquanto a janela ainda está se enchendo: os valores de tX/tY/tZ são
+// os da análise anterior, e o painel não pode mostrá-los como leitura ao vivo.
+bool  leituraValida = false;
 
 // --- ESTADO: MEDINDO -> TRATANDO -> ASSENTANDO -> MEDINDO ---
 // MEDINDO     motores parados, buffer sendo preenchido, análise rodando
@@ -277,7 +293,8 @@ void prepareBuffer(const float* src, int start) {
 // nenhum: quem decide se é tremor é analisaTremor(), olhando os três eixos
 // juntos — senão um tremor de 0,07 g em cada eixo (0,12 g de módulo real)
 // seria descartado três vezes e o total daria zero.
-float analisaEixo(const float* src, int start, float* picoVoluntario) {
+float analisaEixo(const float* src, int start, float* picoVoluntario,
+                  float* mediaTremor) {
   prepareBuffer(src, start);
 
   // Movimento voluntário: 0,50 a 3,00 Hz
@@ -288,13 +305,17 @@ float analisaEixo(const float* src, int start, float* picoVoluntario) {
   }
 
   // Tremor de Parkinson: 3,50 a 7,00 Hz (literatura: 3-7 Hz, modal 4-6 Hz)
-  float picoTre = 0;
+  // Guarda o pico E a média da faixa: a razão entre os dois diz se a energia
+  // está concentrada numa frequência (tremor) ou espalhada (impacto).
+  float picoTre = 0, somaTre = 0;
   for (int i = 0; i < TRE_N; i++) {
     float v = goertzelBand(orderedBuf, TRE_F_MIN + i * F_STEP);
+    somaTre += v;
     if (v > picoTre) picoTre = v;
   }
 
   *picoVoluntario = picoVol;
+  *mediaTremor    = somaTre / TRE_N;
   return picoTre;
 }
 
@@ -304,20 +325,25 @@ float analisaEixo(const float* src, int start, float* picoVoluntario) {
 // e dominância da faixa de tremor sobre a faixa voluntária.
 bool analisaTremor(int start) {
   float volX, volY, volZ;
-  tX = analisaEixo(bufferX, start, &volX);
-  tY = analisaEixo(bufferY, start, &volY);
-  tZ = analisaEixo(bufferZ, start, &volZ);
+  float medX, medY, medZ;
+  tX = analisaEixo(bufferX, start, &volX, &medX);
+  tY = analisaEixo(bufferY, start, &volY, &medY);
+  tZ = analisaEixo(bufferZ, start, &volZ, &medZ);
 
   tTotal = sqrt(tX * tX + tY * tY + tZ * tZ);
   float volTotal = sqrt(volX * volX + volY * volY + volZ * volZ);
+  float medTotal = sqrt(medX * medX + medY * medY + medZ * medZ);
   if (volTotal < 0.001) volTotal = 0.001;
-
-  float dominancia = tTotal / (tTotal + volTotal);
+  if (medTotal < 1e-6)  medTotal = 1e-6;
 
   ultVolTotal   = volTotal;
-  ultDominancia = dominancia;
+  ultDominancia = tTotal / (tTotal + volTotal);
+  ultNitidez    = tTotal / medTotal;
+  leituraValida = true;   // esta janela produziu uma medida de verdade
 
-  return (tTotal >= TREMOR_MIN_G && dominancia >= DOMINANCE_MIN);
+  return (tTotal        >= TREMOR_MIN_G
+       && ultDominancia >= DOMINANCE_MIN
+       && ultNitidez    >= NITIDEZ_MIN);
 }
 
 // --- DIAGNÓSTICO ---
@@ -327,20 +353,20 @@ bool analisaTremor(int start) {
 void imprimeDiagnostico(bool disparou) {
   bool ampOk = (tTotal        >= TREMOR_MIN_G);
   bool domOk = (ultDominancia >= DOMINANCE_MIN);
+  bool nitOk = (ultNitidez    >= NITIDEZ_MIN);
 
-  Serial.print("# tremor=");  Serial.print(tTotal, 3);
-  Serial.print(" g  vol=");   Serial.print(ultVolTotal, 3);
-  Serial.print(" g  dom=");   Serial.print(ultDominancia, 2);
-  Serial.print("   amplitude(>=");  Serial.print(TREMOR_MIN_G, 2);
-  Serial.print(")=");               Serial.print(ampOk ? "ok " : "NAO");
-  Serial.print("  dominancia(>=");  Serial.print(DOMINANCE_MIN, 2);
-  Serial.print(")=");               Serial.print(domOk ? "ok " : "NAO");
-  Serial.print("  -> ");
+  Serial.print("# forca=");    Serial.print(tTotal, 3);
+  Serial.print("g");           Serial.print(ampOk ? "[ok] " : "[--] ");
+  Serial.print(" pureza=");    Serial.print(ultDominancia, 2);
+  Serial.print(domOk ? "[ok] " : "[--] ");
+  Serial.print(" nitidez=");   Serial.print(ultNitidez, 2);
+  Serial.print(nitOk ? "[ok] " : "[--] ");
+  Serial.print(" -> ");
 
-  if (disparou)      Serial.println("DISPARA");
-  else if (!ampOk && !domOk) Serial.println("parado: fraco e sujo demais");
-  else if (!ampOk)   Serial.println("parado: tremor fraco demais");
-  else               Serial.println("parado: movimento voluntario demais na faixa 0.5-3 Hz");
+  if (disparou)    Serial.println("DISPARA");
+  else if (!ampOk) Serial.println("parado: tremor fraco demais");
+  else if (!domOk) Serial.println("parado: muito movimento lento junto (punho girando?)");
+  else             Serial.println("parado: energia espalhada, parece impacto e nao oscilacao");
 }
 
 // --- EMBARALHA A ORDEM DOS DEDOS E APLICA JITTER TEMPORAL (CR) ---
@@ -431,9 +457,10 @@ void limpaBuffers() {
   memset(bufferX, 0, sizeof(bufferX));
   memset(bufferY, 0, sizeof(bufferY));
   memset(bufferZ, 0, sizeof(bufferZ));
-  bufferIndex  = 0;
-  bufferReady  = false;
-  stepCounter  = 0;
+  bufferIndex   = 0;
+  bufferReady   = false;
+  stepCounter   = 0;
+  leituraValida = false;   // até a janela encher, o valor exibido é o antigo
 }
 
 // --- DESLIGA TODOS OS DISPOSITIVOS ---
@@ -598,7 +625,10 @@ void loop() {
       // trocaEstado(MEDINDO) descarta os buffers: sem isso as amostras
       // corrompidas poluiriam as análises pelos próximos 2,56 s.
       trocaEstado(MEDINDO, millis());
+      // Zera a medida inteira, não só a força: senão o painel mostrava
+      // pureza e nitidez antigas ao lado de uma força zerada.
       tX = tY = tZ = tTotal = 0;
+      ultDominancia = ultNitidez = ultVolTotal = 0;
       lastTime   = millis();
       lastSample = millis();
       return;
@@ -642,20 +672,29 @@ void loop() {
     }
 
     // Serial não bloqueia nunca.
-    // Campos: roll,pitch,tX,tY,tZ,tTotal,terapia(0/1),dominancia
+    // Campos: roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez
+    //   estado 0 = medindo, leitura ao vivo
+    //          1 = terapia rodando (leitura congelada)
+    //          2 = medindo, mas a janela ainda está enchendo — os valores
+    //              exibidos são os da análise anterior
+    // Sem o estado 2 o painel mostrava a medida velha como se fosse ao vivo:
+    // logo depois da terapia ele anunciava "TREMOR DETECTADO" com a mão
+    // parada, porque repetia o valor que tinha disparado a terapia.
     // A dominância vai junto para o painel poder dizer qual dos dois critérios
     // barrou. Sem ela o visualizador só via a amplitude e anunciava "TREMOR
     // ACIMA DO LIMIAR" mesmo quando o firmware tinha decidido que não era.
-    // A linha completa chega a ~55 bytes; 64 de folga cobre com margem.
-    if (!DIAGNOSTICO && Serial.availableForWrite() > 64) {
+    // A linha completa chega a ~61 bytes; 64 de folga cobre com margem.
+    if (!DIAGNOSTICO && Serial.availableForWrite() > 80) {
       Serial.print(roll, 2);   Serial.print(",");
       Serial.print(pitch, 2);  Serial.print(",");
       Serial.print(tX, 4);     Serial.print(",");
       Serial.print(tY, 4);     Serial.print(",");
       Serial.print(tZ, 4);     Serial.print(",");
       Serial.print(tTotal, 4); Serial.print(",");
-      Serial.print(estado == TRATANDO ? 1 : 0); Serial.print(",");
-      Serial.println(ultDominancia, 3);
+      Serial.print(estado == TRATANDO ? 1 : (leituraValida ? 0 : 2));
+      Serial.print(",");
+      Serial.print(ultDominancia, 3); Serial.print(",");
+      Serial.println(ultNitidez, 2);
     }
   }
 }
