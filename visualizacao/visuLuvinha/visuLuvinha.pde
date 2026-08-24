@@ -15,14 +15,10 @@ import processing.serial.*;
 //               2 = medindo, janela ainda enchendo (valor exibido e' o antigo)
 //   dominancia  quanto da energia esta em 3,5-7 Hz e nao em 0,5-3 Hz
 //   nitidez     pico da faixa dividido pela media da faixa
-//   modo        0 = contra-estimulo (artigo), 1 = coordinated reset
 //
-// Teclas 1 e 2 trocam o modo de estimulacao em tempo real, mandando um
-// comando pela serial - da' para demonstrar os dois sem regravar a placa.
-//
-// A terapia so liga com os TRES criterios satisfeitos ao mesmo tempo. Este
-// painel mostra os tres lado a lado justamente para deixar claro qual esta
-// faltando quando os motores nao entram.
+// O contra-estimulo so liga com os TRES criterios satisfeitos ao mesmo tempo.
+// Este painel mostra os tres lado a lado justamente para deixar claro qual
+// esta faltando quando os motores nao entram.
 // ============================================================================
 
 Serial porta;
@@ -45,9 +41,6 @@ final int ALT_GRAFICO = 92;
 // --- estados vindos do firmware ---
 final int MEDINDO = 0, TERAPIA = 1, ENCHENDO = 2;
 
-// --- modos de estimulacao (espelham o .ino) ---
-final int MODO_CONTRA = 0, MODO_CR = 1;
-
 // ---------------------------------------------------------------------------
 // ESTADO COMPARTILHADO ENTRE AS DUAS THREADS
 // serialEvent() roda na thread da serial e draw() na thread do sketch. Tudo
@@ -57,7 +50,6 @@ final Object trava = new Object();
 
 float sRoll, sPitch, sX, sY, sZ, sT, sDom, sNit;
 int sEstado = MEDINDO;
-int sModo = MODO_CR;
 int sUltimaLinha = 0, sLinhasOk = 0, sLinhasRuins = 0;
 
 final int HIST = 200;                // 200 amostras a 50 Hz = 4 s
@@ -68,7 +60,6 @@ int sHistIdx = 0;
 // --- copias locais do draw ---
 float roll, pitch, tX, tY, tZ, tTotal, pureza, nitidez;
 int estado = MEDINDO;
-int modo = MODO_CR;
 int ultimaLinha = 0, linhasOk = 0, linhasRuins = 0;
 float[] histT = new float[HIST];
 boolean[] histTerapia = new boolean[HIST];
@@ -164,7 +155,7 @@ void copiaEstado() {
     roll = sRoll;  pitch = sPitch;
     tX = sX;  tY = sY;  tZ = sZ;  tTotal = sT;
     pureza = sDom;  nitidez = sNit;
-    estado = sEstado;  modo = sModo;
+    estado = sEstado;
     ultimaLinha = sUltimaLinha;
     linhasOk = sLinhasOk;  linhasRuins = sLinhasRuins;
     histIdx = sHistIdx;
@@ -283,17 +274,6 @@ void painelEsquerda(boolean conectado) {
 
   int x = 18, y = 30;
 
-  // --- modo de estimulacao ---
-  boolean cr = (modo == MODO_CR);
-  fill(cr ? AZUL : AMBAR);
-  text(cr ? "MODO: COORDINATED RESET" : "MODO: CONTRA-ESTIMULO", x, y);
-  y += 14;
-  fill(FRACO);
-  text(cr ? "pulsos sorteados, 1 dedo por vez" : "5 motores juntos, continuo", x, y);
-  y += 14;
-  text("[1] contra-estimulo   [2] CR", x, y);
-  y += 26;
-
   // --- conexao ---
   if (!conectado) {
     fill(255, 120, 60);
@@ -355,8 +335,8 @@ void desenhaEstado(int x, int y) {
   String titulo, detalhe;
   color cor;
   if (estado == TERAPIA) {
-    cor = AZUL;  titulo = "TERAPIA CR ATIVA";
-    detalhe = "motores pulsando - leitura congelada";
+    cor = AZUL;  titulo = "CONTRA-ESTIMULO ATIVO";
+    detalhe = "motores vibrando - leitura congelada";
   } else if (estado == ENCHENDO) {
     cor = AMBAR; titulo = "ATUALIZANDO JANELA";
     detalhe = "valores abaixo sao da medida anterior";
@@ -399,7 +379,7 @@ void desenhaVeredito(int x, int y, boolean conectado) {
   if (!conectado) return;
 
   if (estado == TERAPIA) {
-    fill(AZUL);  text("terapia em andamento", x, y);
+    fill(AZUL);  text("contra-estimulo em andamento", x, y);
     return;
   }
   if (estado == ENCHENDO) {
@@ -468,7 +448,7 @@ void grafico() {
 
   noStroke();
   fill(FRACO);
-  text("forca do tremor, ultimos 4 s   -   faixa azul = terapia, linha branca = limiar " +
+  text("forca do tremor, ultimos 4 s   -   faixa azul = motores ligados, linha branca = limiar " +
        nf(LIMIAR_FORCA, 1, 2) + " g   -   escala 0 a " + nf(T_MAX, 1, 2) + " g",
        gx + 4, gy + gh + 16);
 }
@@ -491,13 +471,6 @@ float suavizaAngulo(float atual, float alvo, float fator) {
   return atual + d * fator;
 }
 
-// Teclas 1 e 2 trocam o modo de estimulacao. O firmware aceita 'm' e 'c'.
-void keyPressed() {
-  if (porta == null) return;
-  if (key == '1') porta.write('m');        // contra-estimulo
-  else if (key == '2') porta.write('c');   // coordinated reset
-}
-
 // ============================================================================
 // SERIAL  (thread da serial - so toca no bloco protegido pelo lock)
 // ============================================================================
@@ -510,7 +483,7 @@ void serialEvent(Serial p) {
   String[] v = split(linha, ',');
   // O firmware manda 9 campos. Linhas menores sao mensagens de boot,
   // avisos de calibracao ou pacote cortado.
-  if (v.length < 10) { synchronized (trava) { sLinhasRuins++; } return; }
+  if (v.length < 9) { synchronized (trava) { sLinhasRuins++; } return; }
 
   float r  = float(v[0]);
   float pt = float(v[1]);
@@ -534,14 +507,11 @@ void serialEvent(Serial p) {
   if (e.equals("1")) est = TERAPIA;
   else if (e.equals("2")) est = ENCHENDO;
 
-  int md = trim(v[9]).equals("1") ? MODO_CR : MODO_CONTRA;
-
   synchronized (trava) {
     sRoll = r;  sPitch = pt;
     sX = x;  sY = y;  sZ = z;  sT = t;
     sDom = dm;  sNit = nt;
     sEstado = est;
-    sModo = md;
     sUltimaLinha = millis();
     sLinhasOk++;
 

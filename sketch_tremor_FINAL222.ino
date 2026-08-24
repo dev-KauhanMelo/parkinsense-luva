@@ -100,49 +100,31 @@ const float VOL_F_MIN = 0.50;  const int VOL_N = 11;  // 0,50 .. 3,00 Hz (volunt
 const float TRE_F_MIN = 3.50;  const int TRE_N = 15;  // 3,50 .. 7,00 Hz (tremor)
 
 // ===========================================================================
-// MODO DE ESTIMULAÇÃO
+// CONTRA-ESTÍMULO
 // ===========================================================================
-// Os dois modos usam a MESMA detecção e o MESMO ciclo medir/tratar. O que muda
-// é só o que acontece durante a fase de terapia — o que os torna diretamente
-// comparáveis.
+// Detectado o tremor, os cinco motores vibram juntos por alguns segundos.
+// A hipótese é de mascaramento sensorial: a pele, principalmente nas pontas
+// dos dedos, é cheia de mecanorreceptores com projeção grande para o córtex.
+// Uma vibração forte entra por esse caminho e ocupa o canal, disputando espaço
+// com o sinal do tremor.
 //
-//   CONTRA_ESTIMULO  os cinco motores juntos, vibração contínua e forte.
-//                    É a hipótese de mascaramento sensorial: inundar os
-//                    mecanorreceptores para que o sinal do tremor se perca.
-//                    É o que o artigo do projeto descreve.
-//
-//   CR               Coordinated Reset (Tass): pulsos curtos, um dedo por vez,
-//                    ordem sorteada a cada ciclo, com ciclos de silêncio.
-//                    Busca DESSINCRONIZAR a rede em vez de abafar o sinal.
-//                    É a técnica com pesquisa publicada para luva vibratória.
-//
-// Troca em tempo de execução mandando 'm' ou 'c' pela serial (o visualizador
-// manda com as teclas 1 e 2), para poder demonstrar os dois sem regravar.
-enum ModoEstimulo { MODO_CONTRA_ESTIMULO, MODO_CR };
-ModoEstimulo modo = MODO_CR;          // modo inicial
-
-// Intensidade do contra-estímulo (0-255). ATENÇÃO AO CONSUMO: aqui os cinco
-// motores ficam ligados ao mesmo tempo, contra um de cada vez no CR. Se a
-// bateria não segurar, o ESP32 reinicia no meio da demonstração — baixar este
-// valor é o primeiro ajuste a tentar.
+// CONTRA_DUTY  intensidade da vibração (0-255).
+//   ATENÇÃO AO CONSUMO: os cinco motores ligam ao mesmo tempo. Se a bateria
+//   não segurar, o ESP32 reinicia no meio do uso — baixar este valor é o
+//   primeiro ajuste a tentar.
 const int CONTRA_DUTY = 200;
 
-// --- PARÂMETROS COORDINATED RESET (CR) ---
-// Baseado em Tass/Stanford: pulsos curtos, 1 por dedo por ciclo, ordem embaralhada.
-// (ERM não permite fixar 250 Hz de vibração; o ideal para replicar exatamente seria LRA.)
-const unsigned long CR_CYCLE_MS   = 667;  // ciclo de ~1,5 Hz
-const unsigned long CR_BURST_MS   = 100;  // duração do pulso de cada dedo
-const int           CR_BURST_DUTY = 200;  // ~78% (intensidade do pulso, 0-255)
-const long          CR_JITTER_MS  = 15;   // jitter temporal de cada pulso, ±15 ms
-const int           CR_CYCLES_ON  = 3;    // ciclagem do protocolo: 3 ciclos estimulando...
-const int           CR_CYCLES_OFF = 2;    // ...e 2 em silêncio (Tass)
+// BLOCO_TERAPIA_MS  quanto tempo os motores ficam ligados a cada acionamento.
+//   Não é só uma escolha de conforto: enquanto vibram, o acelerômetro está
+//   medindo a própria vibração e não dá para avaliar o tremor. Terminado o
+//   bloco, a luva volta a medir. Ver o ciclo abaixo.
+const unsigned long BLOCO_TERAPIA_MS = 5000;
 
 // --- CICLO MEDIR / TRATAR ---
 // O acelerômetro está na MESMA luva que os motores, então durante a terapia ele
 // mede a própria vibração: a amplitude medida infla (medimos 0,05 g virar
 // 0,094 g) e a leitura deixa de ter significado. Por isso o buffer de detecção
 // só é alimentado com os motores parados — nunca durante a terapia.
-const unsigned long BLOCO_TERAPIA_MS = 2 * (CR_CYCLES_ON + CR_CYCLES_OFF) * CR_CYCLE_MS;  // ~6,7 s
 const unsigned long ASSENTAMENTO_MS  = 250;   // espera o motor parar de girar antes de medir
 
 float bufferX[BUFFER_SIZE];
@@ -172,7 +154,7 @@ bool  leituraValida = false;
 
 // --- ESTADO: MEDINDO -> TRATANDO -> ASSENTANDO -> MEDINDO ---
 // MEDINDO     motores parados, buffer sendo preenchido, análise rodando
-// TRATANDO    padrão CR nos motores; o buffer NÃO é alimentado (blanking)
+// TRATANDO    motores vibrando; o buffer NÃO é alimentado (blanking)
 // ASSENTANDO  motores desligados, esperando o ERM parar de girar
 enum Estado { MEDINDO, TRATANDO, ASSENTANDO };
 Estado        estado       = MEDINDO;
@@ -184,15 +166,10 @@ const int PINOS[10] = {
   MOTOR_POLEGAR, MOTOR_INDICADOR, MOTOR_NERVO_F, MOTOR_NERVO_T, MOTOR_MINDINHO
 };
 
-// Motores (índices lógicos 5-9) acionados pelo padrão CR
+// Índices lógicos dos motores dentro de PINOS[]
 const int MOTOR_IDX[5] = {5, 6, 7, 8, 9};
-int  crOrder[5]  = {0, 1, 2, 3, 4};
-long crJitter[5] = {0, 0, 0, 0, 0};
-int  crLast[5]   = {0, 0, 0, 0, 0};   // duty atual do motor de cada dedo
-int  ledLast[5]  = {-1, -1, -1, -1, -1};
-unsigned long crCycleStart = 0;
-unsigned long crCycleCount = 0;
-bool crAtivo = false;
+int motorDuty[5] = {0, 0, 0, 0, 0};        // duty atual do motor de cada dedo
+int ledLast[5]   = {-1, -1, -1, -1, -1};   // último valor escrito em cada LED
 
 // Protótipos: o Arduino IDE geraria estes sozinho, mas declará-los deixa o
 // arquivo válido como C++ puro e permite compilá-lo fora da IDE.
@@ -402,124 +379,27 @@ void imprimeDiagnostico(bool disparou) {
   else             Serial.println("parado: energia espalhada, parece impacto e nao oscilacao");
 }
 
-// --- EMBARALHA A ORDEM DOS DEDOS E APLICA JITTER TEMPORAL (CR) ---
-// A ordem sorteada é o mecanismo do Coordinated Reset, não um enfeite: um
-// padrão regular reforçaria a sincronia em vez de quebrá-la.
-void shuffleCR() {
-  for (int i = 4; i > 0; i--) {            // Fisher-Yates
-    int j = random(i + 1);
-    int t = crOrder[i]; crOrder[i] = crOrder[j]; crOrder[j] = t;
-  }
-  for (int i = 0; i < 5; i++)
-    crJitter[i] = random(-CR_JITTER_MS, CR_JITTER_MS + 1);
-}
-
-// --- PADRÃO COORDINATED RESET NOS 5 MOTORES ---
-// Cada dedo pulsa 1x por ciclo de CR_CYCLE_MS, em ordem sorteada.
-// Ciclagem: CR_CYCLES_ON ciclos estimulando, CR_CYCLES_OFF em silêncio. A pausa
-// faz parte do protocolo (Tass) — é ela que dá tempo à rede de expressar a
-// dessincronização; estimular sem parar não replica a literatura.
-// Esta função é dona APENAS dos motores. Os LEDs são tratados em atualizaLeds().
-void updateCR(bool active) {
-  if (!active) {
-    if (crAtivo) {
-      for (int i = 0; i < 5; i++) {
-        ledcWrite(PINOS[MOTOR_IDX[i]], 0);
-        crLast[i] = 0;
-      }
-      crAtivo = false;
-    }
-    return;
-  }
-
-  unsigned long now = millis();
-  if (!crAtivo) {
-    crCycleStart = now;
-    crCycleCount = 0;
-    shuffleCR();
-    crAtivo = true;
-  }
-  if (now - crCycleStart >= CR_CYCLE_MS) {
-    crCycleStart += CR_CYCLE_MS;
-    if (now - crCycleStart >= CR_CYCLE_MS) crCycleStart = now;   // re-sincroniza
-    crCycleCount++;
-    shuffleCR();
-  }
-
-  // Ciclo de silêncio da ciclagem: motores parados, mas o relógio do CR segue
-  bool pulsando = (crCycleCount % (CR_CYCLES_ON + CR_CYCLES_OFF)) < CR_CYCLES_ON;
-
-  long phase = (long)(now - crCycleStart);
-  long slot  = (long)(CR_CYCLE_MS / 5);
-
-  for (int sl = 0; sl < 5; sl++) {
-    int phys = crOrder[sl];                       // qual dedo ocupa este slot
-    // O jitter soma CR_JITTER_MS de offset para o slot 0 nunca começar em
-    // instante negativo (antes, um jitter negativo encurtava o 1º pulso em 20%).
-    // Pior caso: 4*133 + 2*15 + 100 = 662 ms, ainda dentro dos 667 do ciclo.
-    long start = (long)sl * slot + CR_JITTER_MS + crJitter[sl];
-    long end   = start + (long)CR_BURST_MS;
-    bool on    = pulsando && (phase >= start && phase < end);
-    int  duty  = on ? CR_BURST_DUTY : 0;
-    if (crLast[phys] != duty) {
-      ledcWrite(PINOS[MOTOR_IDX[phys]], duty);
-      crLast[phys] = duty;
-    }
-  }
-}
-
 // --- CONTRA-ESTÍMULO: OS CINCO MOTORES JUNTOS ---
-// Vibração contínua enquanto a terapia está ativa. Escreve em crLast para que
-// atualizaLeds() acenda todos os LEDs junto, como o artigo descreve ("acionando
-// os motores vibratórios e o LED indicador sempre que os valores ultrapassavam
-// os limiares").
-void updateContraEstimulo(bool active) {
+// Vibração contínua enquanto a terapia está ativa.
+void updateEstimulo(bool active) {
   int duty = active ? CONTRA_DUTY : 0;
   for (int i = 0; i < 5; i++) {
-    if (crLast[i] != duty) {
+    if (motorDuty[i] != duty) {
       ledcWrite(PINOS[MOTOR_IDX[i]], duty);
-      crLast[i] = duty;
+      motorDuty[i] = duty;
     }
-  }
-}
-
-// --- DESPACHO: chama o estimulador do modo ativo ---
-void updateEstimulo(bool active) {
-  if (modo == MODO_CR) updateCR(active);
-  else                 updateContraEstimulo(active);
-}
-
-// --- TROCA DE MODO EM TEMPO DE EXECUÇÃO ---
-// Desliga tudo antes de trocar: cada modo tem o seu próprio estado interno e
-// deixar um pela metade prenderia motor ligado.
-void trocaModo(ModoEstimulo novo) {
-  if (novo == modo) return;
-  updateEstimulo(false);
-  desligarTudo();
-  modo = novo;
-  Serial.println(modo == MODO_CR ? "# modo: COORDINATED RESET"
-                                 : "# modo: CONTRA-ESTIMULO");
-}
-
-// --- COMANDOS PELA SERIAL ---
-// Uma letra por comando, para poder trocar de modo durante a apresentação sem
-// regravar a placa.
-void leComandos() {
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if      (c == 'c' || c == 'C') trocaModo(MODO_CR);
-    else if (c == 'm' || c == 'M') trocaModo(MODO_CONTRA_ESTIMULO);
   }
 }
 
 // --- LEDS: ESPELHO DOS MOTORES ---
-// Cada LED representa o motor do seu dedo e mais nada: acende junto com o
-// pulso CR, apaga junto. (Chegou a existir aqui um brilho de fundo
-// proporcional ao tremor medido, mas na bancada ele acendia com qualquer
-// movimentinho e mais atrapalhava do que ajudava a ler o que a luva faz.)
+// Cada LED acende junto com o motor do seu dedo e apaga junto, como o artigo
+// descreve ("acionando os motores vibratórios e o LED indicador sempre que os
+// valores ultrapassavam os limiares"). Chegou a existir aqui um brilho de
+// fundo proporcional ao tremor medido, mas na bancada ele acendia com qualquer
+// movimentinho e mais atrapalhava do que ajudava a ler o que a luva faz.
 void atualizaLeds() {
   for (int i = 0; i < 5; i++) {
-    int alvo = (crLast[i] > 0) ? 255 : 0;
+    int alvo = (motorDuty[i] > 0) ? 255 : 0;
     if (alvo != ledLast[i]) {
       ledcWrite(PINOS[i], alvo);
       ledLast[i] = alvo;
@@ -543,8 +423,7 @@ void limpaBuffers() {
 // --- DESLIGA TODOS OS DISPOSITIVOS ---
 void desligarTudo() {
   for (int i = 0; i < 10; i++) ledcWrite(PINOS[i], 0);
-  for (int i = 0; i < 5; i++) { crLast[i] = 0; ledLast[i] = 0; }
-  crAtivo = false;
+  for (int i = 0; i < 5; i++) { motorDuty[i] = 0; ledLast[i] = 0; }
 }
 
 // --- TROCA DE ESTADO ---
@@ -628,12 +507,6 @@ void setup() {
 
   Serial.println("DEBUG: teste concluido.");
 
-  randomSeed(esp_random());   // semente para o embaralhamento do CR
-
-  Serial.println(modo == MODO_CR ? "# modo: COORDINATED RESET"
-                                 : "# modo: CONTRA-ESTIMULO");
-  Serial.println("# troque com 'c' (CR) ou 'm' (contra-estimulo)");
-
   calibrateMPU();
 
   // Watchdog: se o loop travar com um motor acionado, o ESP32 reinicia em vez
@@ -656,10 +529,9 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   esp_task_wdt_reset();
-  leComandos();
 
-  // O padrão CR exige timing fino, então a máquina de estados roda a cada
-  // iteração — independente da taxa de amostragem de 50 Hz.
+  // A máquina de estados roda a cada iteração, independente da taxa de
+  // amostragem de 50 Hz, para o fim do bloco cair no instante certo.
   switch (estado) {
     case TRATANDO:
       updateEstimulo(true);
@@ -754,8 +626,7 @@ void loop() {
     }
 
     // Serial não bloqueia nunca.
-    // Campos: roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez,modo
-    //   modo   0 = contra-estimulo, 1 = coordinated reset
+    // Campos: roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez
     //   estado 0 = medindo, leitura ao vivo
     //          1 = terapia rodando (leitura congelada)
     //          2 = medindo, mas a janela ainda está enchendo — os valores
@@ -766,7 +637,7 @@ void loop() {
     // A dominância vai junto para o painel poder dizer qual dos dois critérios
     // barrou. Sem ela o visualizador só via a amplitude e anunciava "TREMOR
     // ACIMA DO LIMIAR" mesmo quando o firmware tinha decidido que não era.
-    // A linha completa chega a ~63 bytes; 80 de folga cobre com margem.
+    // A linha completa chega a ~61 bytes; 80 de folga cobre com margem.
     if (!DIAGNOSTICO && Serial.availableForWrite() > 80) {
       Serial.print(roll, 2);   Serial.print(",");
       Serial.print(pitch, 2);  Serial.print(",");
@@ -777,8 +648,7 @@ void loop() {
       Serial.print(estado == TRATANDO ? 1 : (leituraValida ? 0 : 2));
       Serial.print(",");
       Serial.print(ultDominancia, 3); Serial.print(",");
-      Serial.print(ultNitidez, 2); Serial.print(",");
-      Serial.println(modo == MODO_CR ? 1 : 0);
+      Serial.println(ultNitidez, 2);
     }
   }
 }
