@@ -99,6 +99,34 @@ const float F_STEP    = 0.25;
 const float VOL_F_MIN = 0.50;  const int VOL_N = 11;  // 0,50 .. 3,00 Hz (voluntário)
 const float TRE_F_MIN = 3.50;  const int TRE_N = 15;  // 3,50 .. 7,00 Hz (tremor)
 
+// ===========================================================================
+// MODO DE ESTIMULAÇÃO
+// ===========================================================================
+// Os dois modos usam a MESMA detecção e o MESMO ciclo medir/tratar. O que muda
+// é só o que acontece durante a fase de terapia — o que os torna diretamente
+// comparáveis.
+//
+//   CONTRA_ESTIMULO  os cinco motores juntos, vibração contínua e forte.
+//                    É a hipótese de mascaramento sensorial: inundar os
+//                    mecanorreceptores para que o sinal do tremor se perca.
+//                    É o que o artigo do projeto descreve.
+//
+//   CR               Coordinated Reset (Tass): pulsos curtos, um dedo por vez,
+//                    ordem sorteada a cada ciclo, com ciclos de silêncio.
+//                    Busca DESSINCRONIZAR a rede em vez de abafar o sinal.
+//                    É a técnica com pesquisa publicada para luva vibratória.
+//
+// Troca em tempo de execução mandando 'm' ou 'c' pela serial (o visualizador
+// manda com as teclas 1 e 2), para poder demonstrar os dois sem regravar.
+enum ModoEstimulo { MODO_CONTRA_ESTIMULO, MODO_CR };
+ModoEstimulo modo = MODO_CR;          // modo inicial
+
+// Intensidade do contra-estímulo (0-255). ATENÇÃO AO CONSUMO: aqui os cinco
+// motores ficam ligados ao mesmo tempo, contra um de cada vez no CR. Se a
+// bateria não segurar, o ESP32 reinicia no meio da demonstração — baixar este
+// valor é o primeiro ajuste a tentar.
+const int CONTRA_DUTY = 200;
+
 // --- PARÂMETROS COORDINATED RESET (CR) ---
 // Baseado em Tass/Stanford: pulsos curtos, 1 por dedo por ciclo, ordem embaralhada.
 // (ERM não permite fixar 250 Hz de vibração; o ideal para replicar exatamente seria LRA.)
@@ -165,6 +193,11 @@ int  ledLast[5]  = {-1, -1, -1, -1, -1};
 unsigned long crCycleStart = 0;
 unsigned long crCycleCount = 0;
 bool crAtivo = false;
+
+// Protótipos: o Arduino IDE geraria estes sozinho, mas declará-los deixa o
+// arquivo válido como C++ puro e permite compilá-lo fora da IDE.
+void desligarTudo();
+void limpaBuffers();
 
 // --- CONFIGURAÇÃO DO MPU (boot e recuperação de I2C) ---
 // Centralizada para o recovery não esquecer nenhum registrador — em especial
@@ -435,6 +468,50 @@ void updateCR(bool active) {
   }
 }
 
+// --- CONTRA-ESTÍMULO: OS CINCO MOTORES JUNTOS ---
+// Vibração contínua enquanto a terapia está ativa. Escreve em crLast para que
+// atualizaLeds() acenda todos os LEDs junto, como o artigo descreve ("acionando
+// os motores vibratórios e o LED indicador sempre que os valores ultrapassavam
+// os limiares").
+void updateContraEstimulo(bool active) {
+  int duty = active ? CONTRA_DUTY : 0;
+  for (int i = 0; i < 5; i++) {
+    if (crLast[i] != duty) {
+      ledcWrite(PINOS[MOTOR_IDX[i]], duty);
+      crLast[i] = duty;
+    }
+  }
+}
+
+// --- DESPACHO: chama o estimulador do modo ativo ---
+void updateEstimulo(bool active) {
+  if (modo == MODO_CR) updateCR(active);
+  else                 updateContraEstimulo(active);
+}
+
+// --- TROCA DE MODO EM TEMPO DE EXECUÇÃO ---
+// Desliga tudo antes de trocar: cada modo tem o seu próprio estado interno e
+// deixar um pela metade prenderia motor ligado.
+void trocaModo(ModoEstimulo novo) {
+  if (novo == modo) return;
+  updateEstimulo(false);
+  desligarTudo();
+  modo = novo;
+  Serial.println(modo == MODO_CR ? "# modo: COORDINATED RESET"
+                                 : "# modo: CONTRA-ESTIMULO");
+}
+
+// --- COMANDOS PELA SERIAL ---
+// Uma letra por comando, para poder trocar de modo durante a apresentação sem
+// regravar a placa.
+void leComandos() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if      (c == 'c' || c == 'C') trocaModo(MODO_CR);
+    else if (c == 'm' || c == 'M') trocaModo(MODO_CONTRA_ESTIMULO);
+  }
+}
+
 // --- LEDS: ESPELHO DOS MOTORES ---
 // Cada LED representa o motor do seu dedo e mais nada: acende junto com o
 // pulso CR, apaga junto. (Chegou a existir aqui um brilho de fundo
@@ -553,6 +630,10 @@ void setup() {
 
   randomSeed(esp_random());   // semente para o embaralhamento do CR
 
+  Serial.println(modo == MODO_CR ? "# modo: COORDINATED RESET"
+                                 : "# modo: CONTRA-ESTIMULO");
+  Serial.println("# troque com 'c' (CR) ou 'm' (contra-estimulo)");
+
   calibrateMPU();
 
   // Watchdog: se o loop travar com um motor acionado, o ESP32 reinicia em vez
@@ -575,22 +656,23 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   esp_task_wdt_reset();
+  leComandos();
 
   // O padrão CR exige timing fino, então a máquina de estados roda a cada
   // iteração — independente da taxa de amostragem de 50 Hz.
   switch (estado) {
     case TRATANDO:
-      updateCR(true);
+      updateEstimulo(true);
       if (now - estadoInicio >= BLOCO_TERAPIA_MS) trocaEstado(ASSENTANDO, now);
       break;
 
     case ASSENTANDO:
-      updateCR(false);
+      updateEstimulo(false);
       if (now - estadoInicio >= ASSENTAMENTO_MS) trocaEstado(MEDINDO, now);
       break;
 
     case MEDINDO:
-      updateCR(false);
+      updateEstimulo(false);
       break;
   }
 
@@ -672,7 +754,8 @@ void loop() {
     }
 
     // Serial não bloqueia nunca.
-    // Campos: roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez
+    // Campos: roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez,modo
+    //   modo   0 = contra-estimulo, 1 = coordinated reset
     //   estado 0 = medindo, leitura ao vivo
     //          1 = terapia rodando (leitura congelada)
     //          2 = medindo, mas a janela ainda está enchendo — os valores
@@ -683,7 +766,7 @@ void loop() {
     // A dominância vai junto para o painel poder dizer qual dos dois critérios
     // barrou. Sem ela o visualizador só via a amplitude e anunciava "TREMOR
     // ACIMA DO LIMIAR" mesmo quando o firmware tinha decidido que não era.
-    // A linha completa chega a ~61 bytes; 64 de folga cobre com margem.
+    // A linha completa chega a ~63 bytes; 80 de folga cobre com margem.
     if (!DIAGNOSTICO && Serial.availableForWrite() > 80) {
       Serial.print(roll, 2);   Serial.print(",");
       Serial.print(pitch, 2);  Serial.print(",");
@@ -694,7 +777,8 @@ void loop() {
       Serial.print(estado == TRATANDO ? 1 : (leituraValida ? 0 : 2));
       Serial.print(",");
       Serial.print(ultDominancia, 3); Serial.print(",");
-      Serial.println(ultNitidez, 2);
+      Serial.print(ultNitidez, 2); Serial.print(",");
+      Serial.println(modo == MODO_CR ? 1 : 0);
     }
   }
 }

@@ -117,7 +117,40 @@ de para que serve cada um e o que acontece ao mexer.
 A decisão usa o **módulo dos três eixos**, não eixo a eixo: um tremor de 0,07 g
 em cada eixo tem módulo real de 0,12 g e não pode ser descartado três vezes.
 
-### 2. Terapia
+### 2. Terapia — dois modos
+
+A luva implementa **duas hipóteses diferentes** sobre por que a vibração
+reduziria o tremor. Elas compartilham a mesma detecção e o mesmo ciclo
+medir/tratar; muda só o que acontece durante a estimulação, o que as torna
+diretamente comparáveis.
+
+| | `CONTRA-ESTÍMULO` | `CR` |
+|---|---|---|
+| Ideia | mascaramento sensorial: inundar os mecanorreceptores para o sinal do tremor se perder | dessincronizar a rede de neurônios que dispara em bloco |
+| Motores | os 5 juntos, contínuo | 1 dedo por vez, ordem sorteada |
+| Pausas | nenhuma | 3 ciclos estimulando, 2 em silêncio |
+| LEDs | todos acesos junto | só o dedo sendo pulsado |
+| Efeito esperado | enquanto está ligado | cumulativo, ao longo de semanas |
+| Base | intuitiva | pesquisa publicada (Tass e col.) |
+
+O contra-estímulo é o que o artigo do projeto descreve. O CR é a técnica com
+estudos publicados para luva vibratória — e o motivo de todo o cuidado com
+ordem sorteada, jitter e ciclagem.
+
+**Importante para quem for demonstrar:** o benefício relatado do CR é
+cumulativo e persistente, não imediato. Ligar a luva não faz o tremor parar na
+hora, e isso não significa defeito. O contra-estímulo é o modo com chance de
+efeito perceptível na hora — e o menos embasado. Essa troca é o ponto que vale
+explicar.
+
+**Troca em tempo real** pela serial: `m` = contra-estímulo, `c` = CR. No
+visualizador, teclas `1` e `2`. Não precisa regravar a placa.
+
+**Consumo:** no contra-estímulo os cinco motores ficam ligados ao mesmo tempo,
+contra um de cada vez no CR. Se a bateria não segurar e o ESP32 reiniciar,
+baixe `CONTRA_DUTY` no topo do `.ino`.
+
+### Parâmetros do CR
 
 ```
 CR_CYCLE_MS   667 ms    ciclo de ~1,5 Hz
@@ -157,8 +190,9 @@ faixa 3,5–7 Hz e seria lida como tremor.
 
 ### 4. Indicação visual
 
-Cada LED espelha o motor do seu dedo: acende junto com o pulso CR e apaga
-junto. Fora da terapia todos ficam apagados.
+Cada LED espelha o motor do seu dedo: acende com ele e apaga com ele. No modo
+CR isso significa um LED de cada vez; no contra-estímulo, todos juntos. Fora da
+terapia todos ficam apagados.
 
 ---
 
@@ -167,7 +201,7 @@ junto. Fora da terapia todos ficam apagados.
 115200 baud, uma linha por amostra (50 Hz), 7 campos separados por vírgula:
 
 ```
-roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez
+roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez,modo
 ```
 
 | Campo | Unidade | Descrição |
@@ -178,6 +212,7 @@ roll,pitch,tX,tY,tZ,tTotal,estado,dominancia,nitidez
 | `estado` | 0/1/2 | 0 = medindo (ao vivo), 1 = terapia, 2 = janela enchendo |
 | `dominancia` | 0–1 | fração da energia na faixa de tremor (2º critério) |
 | `nitidez` | ≥0 | pico da faixa ÷ média da faixa (3º critério) |
+| `modo` | 0/1 | 0 = contra-estímulo, 1 = coordinated reset |
 
 O **estado 2** existe porque, logo depois de uma sessão de terapia, o firmware
 descarta a janela e leva 2,56 s para enchê-la de novo. Nesse intervalo os
@@ -196,7 +231,8 @@ Dois detalhes que confundem quem lê pela primeira vez:
 
 No boot o firmware também imprime mensagens de diagnóstico que **não** seguem
 esse formato (teste sequencial, offsets de calibração, erros de I2C). Qualquer
-consumidor deve descartar linhas com menos de 9 campos.
+consumidor deve descartar linhas com menos de 10 campos.
+Linhas iniciadas por `#` são avisos do firmware (modo ativo, diagnóstico).
 
 Ligando `DIAGNOSTICO = true` no topo do `.ino`, a telemetria dá lugar a uma
 linha por análise dizendo os valores medidos e qual critério barrou — útil no
@@ -209,6 +245,8 @@ Monitor Serial (o visualizador não funciona nesse modo).
 `visualizacao/visuLuvinha/` é um sketch em Processing que mostra a mão em 3D,
 as barras de amplitude por eixo com a marca do limiar, o histórico dos últimos
 4 s e o estado da terapia.
+
+Teclas `1` e `2` trocam o modo de estimulação em tempo real.
 
 A porta serial é detectada automaticamente (procura `ttyUSB`, `ttyACM`, `COM`).
 Para forçar uma porta específica, mude `PORTA_IDX` no topo do arquivo.
