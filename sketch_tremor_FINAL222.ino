@@ -3,20 +3,25 @@
 
 MPU6050 mpu;
 
-// --- PINOS FÍSICOS ---
-// OBS.: MOTOR_X (GPIO2) e MOTOR_Z (GPIO5) são pinos de "strapping" do ESP32.
-// Se houver boot intermitente, revisar o circuito de acionamento desses pinos.
-const int LED_X      = 27;
-const int LED_Y      = 26;
-const int LED_Z      = 25;
-const int LED_TOTAL  = 33;
-const int LED_REFORC = 32;
+// --- MAPEAMENTO DEDO <-> MOTOR <-> LED ---
+// Cada canal (0-4) = um dedo/posição, com seu LED indicador e seu motor.
+// Motores em pinos NÃO-strapping (evita os problemas de boot do GPIO2/GPIO5).
+//   Canal 0  Polegar (dedão)                LED 27   MOTOR 4
+//   Canal 1  Indicador                      LED 26   MOTOR 18
+//   Canal 2  Nervo frente (meio-anelar)     LED 25   MOTOR 23
+//   Canal 3  Nervo trás   (meio-anelar)     LED 33   MOTOR 13
+//   Canal 4  Mindinho                       LED 32   MOTOR 19
+const int LED_POLEGAR   = 27;
+const int LED_INDICADOR = 26;
+const int LED_NERVO_F   = 25;
+const int LED_NERVO_T   = 33;
+const int LED_MINDINHO  = 32;
 
-const int MOTOR_X     = 2;
-const int MOTOR_Y     = 4;
-const int MOTOR_Z     = 5;
-const int MOTOR_TOTAL = 18;
-const int MOTOR_REFOR = 19;
+const int MOTOR_POLEGAR   = 4;
+const int MOTOR_INDICADOR = 18;
+const int MOTOR_NERVO_F   = 23;
+const int MOTOR_NERVO_T   = 13;
+const int MOTOR_MINDINHO  = 19;
 
 // --- CONFIGURAÇÕES ---
 const float ALPHA       = 0.96;   // filtro complementar (só telemetria roll/pitch)
@@ -27,9 +32,8 @@ const int   STEP        = 16;     // recalcula a detecção a cada 16 amostras (
 // --- LIMIARES DE DETECÇÃO (em unidades físicas, g) ---
 // Tremor senoidal: a_pico = (2*pi*f)^2 * deslocamento.
 //   ~0,08 g  ≈ tremor de ~0,8 mm a 5 Hz  -> limiar de detecção
-//   ~0,60 g  ≈ tremor de ~6 mm a 5 Hz    -> saturação da escala dos LEDs
+// (O visualizador em Processing usa ~0,60 g como fundo de escala das barras.)
 const float TREMOR_MIN_G   = 0.08;
-const float MAX_INTENSITY  = 0.60;
 const float DOMINANCE_MIN  = 0.75;  // fração da energia que precisa estar na faixa de tremor
 
 // --- PARÂMETROS COORDINATED RESET (CR) ---
@@ -61,12 +65,10 @@ float tX = 0, tY = 0, tZ = 0, tTotal = 0;
 bool          hasDetected = false;
 unsigned long lastTremorDetected = 0;
 
-// lastPWM indexado por posição lógica 0-4 (só LEDs). Motores usam crLast.
-float lastPWM[10] = {0};
-
+// Índices 0-4 = LEDs (por dedo); índices 5-9 = motores (mesmo dedo, +5).
 const int PINOS[10] = {
-  LED_X, LED_Y, LED_Z, LED_TOTAL, LED_REFORC,
-  MOTOR_X, MOTOR_Y, MOTOR_Z, MOTOR_TOTAL, MOTOR_REFOR
+  LED_POLEGAR,   LED_INDICADOR,   LED_NERVO_F,   LED_NERVO_T,   LED_MINDINHO,
+  MOTOR_POLEGAR, MOTOR_INDICADOR, MOTOR_NERVO_F, MOTOR_NERVO_T, MOTOR_MINDINHO
 };
 
 // Motores (índices lógicos 5-9) acionados pelo padrão CR
@@ -149,15 +151,6 @@ float tremorRatio(float* buffer, int start) {
   return tremorPeak;  // amplitude (g) da frequência de tremor dominante
 }
 
-// --- PWM COM HISTERESE (só LEDs, índice lógico 0-4) ---
-void setDevice(int idx, float intensidade, float maxVal) {
-  float ratio = constrain(intensidade / maxVal, 0.0, 1.0);
-  if (ratio == 0.0 && lastPWM[idx] == 0.0) return;
-  if (fabs(ratio - lastPWM[idx]) < 0.05) return;
-  lastPWM[idx] = ratio;
-  ledcWrite(PINOS[idx], (int)(ratio * 255));
-}
-
 // --- EMBARALHA A ORDEM DOS DEDOS E APLICA JITTER TEMPORAL (CR) ---
 void shuffleCR() {
   for (int i = 4; i > 0; i--) {            // Fisher-Yates
@@ -168,12 +161,18 @@ void shuffleCR() {
 }
 
 // --- PADRÃO COORDINATED RESET NOS 5 MOTORES ---
+// Cada dedo pulsa 1x por ciclo. O LED do mesmo canal acende JUNTO com o motor,
+// deixando visível qual dedo está sendo estimulado (associação LED<->motor<->dedo).
 void updateCR(bool active) {
   static bool wasActive = false;
 
   if (!active) {
     if (wasActive) {
-      for (int i = 0; i < 5; i++) { ledcWrite(PINOS[MOTOR_IDX[i]], 0); crLast[i] = 0; }
+      for (int i = 0; i < 5; i++) {
+        ledcWrite(PINOS[MOTOR_IDX[i]], 0);  // motor do canal i
+        ledcWrite(PINOS[i], 0);             // LED do canal i
+        crLast[i] = 0;
+      }
       wasActive = false;
     }
     return;
@@ -184,16 +183,17 @@ void updateCR(bool active) {
   if (now - crCycleStart >= CR_CYCLE_MS) { crCycleStart = now; shuffleCR(); }
 
   long phase = (long)(now - crCycleStart);
-  long slot  = (long)(CR_CYCLE_MS / 5);    // ~133 ms por dedo
+  long slot  = (long)(CR_CYCLE_MS / 5); 
 
   for (int s = 0; s < 5; s++) {
-    int phys = crOrder[s];                 // qual motor ocupa este slot
-    int m    = MOTOR_IDX[phys];
+    int phys = crOrder[s];                 
     long start = (long)s * slot + crJitter[s];
     long end   = start + (long)CR_BURST_MS;
-    int duty = (phase >= start && phase < end) ? CR_BURST_DUTY : 0;
+    bool on = (phase >= start && phase < end);
+    int duty = on ? CR_BURST_DUTY : 0;
     if (crLast[phys] != duty) {
-      ledcWrite(PINOS[m], duty);
+      ledcWrite(PINOS[MOTOR_IDX[phys]], duty);
+      ledcWrite(PINOS[phys], on ? 255 : 0); 
       crLast[phys] = duty;
     }
   }
@@ -201,10 +201,7 @@ void updateCR(bool active) {
 
 // --- DESLIGA TODOS OS DISPOSITIVOS ---
 void desligarTudo() {
-  for (int i = 0; i < 10; i++) {
-    ledcWrite(PINOS[i], 0);
-    lastPWM[i] = 0;
-  }
+  for (int i = 0; i < 10; i++) ledcWrite(PINOS[i], 0);
   for (int i = 0; i < 5; i++) crLast[i] = 0;
 }
 
@@ -222,36 +219,49 @@ void setup() {
   mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);   // ±250 dps -> 131 LSB/dps
 
   // LEDs: 5000 Hz (indicadores visuais, luz suave)
-  if (!ledcAttach(LED_X,      5000, 8)) Serial.println("Falha LEDC LED_X");
-  if (!ledcAttach(LED_Y,      5000, 8)) Serial.println("Falha LEDC LED_Y");
-  if (!ledcAttach(LED_Z,      5000, 8)) Serial.println("Falha LEDC LED_Z");
-  if (!ledcAttach(LED_TOTAL,  5000, 8)) Serial.println("Falha LEDC LED_TOTAL");
-  if (!ledcAttach(LED_REFORC, 5000, 8)) Serial.println("Falha LEDC LED_REFORC");
+  if (!ledcAttach(LED_POLEGAR,   5000, 8)) Serial.println("Falha LEDC LED_POLEGAR");
+  if (!ledcAttach(LED_INDICADOR, 5000, 8)) Serial.println("Falha LEDC LED_INDICADOR");
+  if (!ledcAttach(LED_NERVO_F,   5000, 8)) Serial.println("Falha LEDC LED_NERVO_F");
+  if (!ledcAttach(LED_NERVO_T,   5000, 8)) Serial.println("Falha LEDC LED_NERVO_T");
+  if (!ledcAttach(LED_MINDINHO,  5000, 8)) Serial.println("Falha LEDC LED_MINDINHO");
 
   // Motores ERM: 20 kHz (PWM inaudível; a inércia do motor filtra para tensão média)
-  if (!ledcAttach(MOTOR_X,     20000, 8)) Serial.println("Falha LEDC MOTOR_X");
-  if (!ledcAttach(MOTOR_Y,     20000, 8)) Serial.println("Falha LEDC MOTOR_Y");
-  if (!ledcAttach(MOTOR_Z,     20000, 8)) Serial.println("Falha LEDC MOTOR_Z");
-  if (!ledcAttach(MOTOR_TOTAL, 20000, 8)) Serial.println("Falha LEDC MOTOR_TOTAL");
-  if (!ledcAttach(MOTOR_REFOR, 20000, 8)) Serial.println("Falha LEDC MOTOR_REFOR");
+  if (!ledcAttach(MOTOR_POLEGAR,   20000, 8)) Serial.println("Falha LEDC MOTOR_POLEGAR");
+  if (!ledcAttach(MOTOR_INDICADOR, 20000, 8)) Serial.println("Falha LEDC MOTOR_INDICADOR");
+  if (!ledcAttach(MOTOR_NERVO_F,   20000, 8)) Serial.println("Falha LEDC MOTOR_NERVO_F");
+  if (!ledcAttach(MOTOR_NERVO_T,   20000, 8)) Serial.println("Falha LEDC MOTOR_NERVO_T");
+  if (!ledcAttach(MOTOR_MINDINHO,  20000, 8)) Serial.println("Falha LEDC MOTOR_MINDINHO");
 
   memset(bufferX, 0, sizeof(bufferX));
   memset(bufferY, 0, sizeof(bufferY));
   memset(bufferZ, 0, sizeof(bufferZ));
 
-  // TESTE: acende todos os LEDs em 100% por 3 segundos
-  ledcWrite(LED_X, 255);   ledcWrite(LED_Y, 255);   ledcWrite(LED_Z, 255);
-  ledcWrite(LED_TOTAL, 255); ledcWrite(LED_REFORC, 255);
-  delay(3000);
-  ledcWrite(LED_X, 0);     ledcWrite(LED_Y, 0);     ledcWrite(LED_Z, 0);
-  ledcWrite(LED_TOTAL, 0); ledcWrite(LED_REFORC, 0);
+  // DEBUG: testa cada dispositivo UM DE CADA VEZ (isola problema de
+  // alimentacao compartilhada vs. fiacao por canal) e imprime nome/pino
+  // no Serial. Roda antes da calibracao: motores param antes de calibrar.
+  const char* NOMES[10] = {
+    "LED Polegar (27)",   "LED Indicador (26)", "LED NervoFrente (25)",
+    "LED NervoTras (33)", "LED Mindinho (32)",
+    "MOTOR Polegar (4)",  "MOTOR Indicador (18)", "MOTOR NervoFrente (23)",
+    "MOTOR NervoTras (13)", "MOTOR Mindinho (19)"
+  };
+  Serial.println("DEBUG: teste sequencial (um por vez, 1,2 s cada)...");
+  for (int i = 0; i < 10; i++) {
+    Serial.print("  -> "); Serial.println(NOMES[i]);
+    ledcWrite(PINOS[i], 255);
+    delay(1200);
+    ledcWrite(PINOS[i], 0);
+    delay(300);
+  }
 
-  // MPU obrigatório: se não responder, sinaliza piscando LED_TOTAL (em vez de travar silenciosamente)
+  Serial.println("DEBUG: teste concluido.");
+
+  // MPU obrigatório: se não responder, sinaliza piscando o LED do mindinho (em vez de travar silenciosamente)
   if (!mpu.testConnection()) {
     Serial.println("ERRO: MPU6050 nao encontrado!");
     while (true) {
-      ledcWrite(LED_TOTAL, 255); delay(200);
-      ledcWrite(LED_TOTAL, 0);   delay(200);
+      ledcWrite(LED_MINDINHO, 255); delay(200);
+      ledcWrite(LED_MINDINHO, 0);   delay(200);
     }
   }
 
@@ -324,14 +334,8 @@ void loop() {
       tZ     = tremorRatio(bufferZ, start);
       tTotal = sqrt(tX * tX + tY * tY + tZ * tZ);
 
-      // LEDs: indicação visual proporcional (ótimo para demonstração)
-      setDevice(0, tX,     MAX_INTENSITY);        // LED_X
-      setDevice(1, tY,     MAX_INTENSITY);        // LED_Y
-      setDevice(2, tZ,     MAX_INTENSITY);        // LED_Z
-      setDevice(3, tTotal, MAX_INTENSITY);        // LED_TOTAL
-      setDevice(4, tTotal, MAX_INTENSITY * 0.8);  // LED_REFORC
-
-      // Aciona a terapia (motores em modo CR) quando há tremor
+      // Aciona a terapia quando há tremor. No modo CR, cada LED acende
+      // junto com o motor do seu dedo (feito em updateCR()).
       if (tTotal > 0.0) {
         hasDetected = true;
         lastTremorDetected = now;
