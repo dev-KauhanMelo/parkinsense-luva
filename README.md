@@ -1,0 +1,262 @@
+# ParkinSense
+
+Luva experimental que detecta tremor parkinsoniano e responde com estimulação
+vibrotátil no padrão **Coordinated Reset**.
+
+> **Protótipo acadêmico.** Não é dispositivo médico, não passou por validação
+> clínica e **nunca foi testado em alguém com Parkinson**. Todo o comportamento
+> descrito aqui foi verificado com sinais sintéticos e simulação, não com
+> pacientes.
+
+---
+
+## A ideia
+
+No Parkinson, populações de neurônios que deveriam disparar de forma
+independente passam a disparar **em sincronia**, num ritmo de 4 a 7 Hz. É essa
+sincronia patológica que chega aos dedos e produz o tremor.
+
+Colocando de forma bem direta: o cérebro manda uma enxurrada de sinais nervosos
+descoordenados para os dedos, e é isso que faz a mão tremer. A sacada da luva é
+que a pele — principalmente nas pontas dos dedos — é cheia de mecanorreceptores,
+com uma projeção enorme para o córtex. Uma vibração forte e bem colocada entra
+por esse caminho e ocupa o canal, "atrapalhando" o padrão sincronizado.
+
+A técnica que formaliza isso é o **Coordinated Reset (CR)**, proposto por Peter
+Tass. Ela não tenta bloquear o sinal: entrega estímulos curtos em pontos
+diferentes e **em ordem sorteada**, de modo que cada sub-população receba um
+"reset" de fase num instante distinto. O grupo se dessincroniza. Como a rede
+aprende por plasticidade dependente de disparo, a ideia é que ela vá
+*desaprendendo* o padrão sincronizado — daí os relatos de benefício que persiste
+depois de desligar o aparelho.
+
+**A ordem embaralhada é o mecanismo, não um enfeite.** Um padrão regular e
+previsível reforçaria a sincronia em vez de quebrá-la. Se você olhar a luva
+funcionando e achar que os motores estão pulsando de forma aleatória, é
+exatamente isso que deveria estar acontecendo.
+
+---
+
+## Hardware
+
+| Componente | Quantidade | Observação |
+|---|---|---|
+| ESP32 (DevKit) | 1 | |
+| MPU6050 | 1 | acelerômetro + giroscópio, I2C |
+| Motor de vibração ERM | 5 | um por canal |
+| Transistor | 5 | um por motor, o GPIO não aciona o motor direto |
+| LED + resistor | 5 | indicador por canal |
+
+### Mapeamento dos pinos
+
+| Canal | Posição | LED | Motor |
+|---|---|---|---|
+| 0 | Polegar | 27 | 4 |
+| 1 | Indicador | 26 | 18 |
+| 2 | Nervo frente | 25 | 23 |
+| 3 | Nervo trás | 33 | 13 |
+| 4 | Mindinho | 32 | 19 |
+
+MPU6050 no I2C padrão: **SDA 21, SCL 22**.
+
+Os motores ficam deliberadamente fora dos pinos de *strapping* do ESP32
+(GPIO 0, 2, 5, 12 e 15). Se o driver forçar nível errado num desses pinos
+durante o reset, a placa não dá boot.
+
+> **Recomendação de montagem:** coloque um resistor de *pull-down* na base de
+> cada transistor. Entre o reset e o `setup()` os GPIOs ficam em entrada e a
+> base flutua, o que pode ligar o motor. O firmware força nível baixo assim que
+> começa a rodar, mas essa janela inicial só o hardware fecha.
+
+---
+
+## Como funciona o firmware
+
+### 1. Detecção
+
+O acelerômetro é lido a **50 Hz**. As amostras entram num buffer circular de
+**128 posições** — uma janela de **2,56 s**, o que dá resolução de 0,39 Hz.
+
+A cada 16 amostras (~0,32 s) a janela é reanalisada. O sinal é preparado assim:
+remove-se a média (mata o DC da gravidade) e aplica-se uma **janela de Hann**,
+que impede que um movimento voluntário lento vaze energia para a faixa do
+tremor. Depois, um **algoritmo de Goertzel** mede a amplitude em frequências
+específicas:
+
+| Banda | Faixa | Sondas |
+|---|---|---|
+| Movimento voluntário | 0,50 – 3,00 Hz | 11 (passo 0,25 Hz) |
+| Tremor parkinsoniano | 3,50 – 7,00 Hz | 15 (passo 0,25 Hz) |
+
+O resultado sai direto em **g**, com significado físico. Dispara a terapia
+quando os dois critérios são satisfeitos ao mesmo tempo:
+
+- **amplitude** `|T| ≥ 0,08 g` — equivale a um tremor de ~0,8 mm a 5 Hz
+- **dominância** `≥ 0,75` — a maior parte da energia tem que estar na faixa de
+  tremor, e não na de movimento voluntário
+
+A decisão usa o **módulo dos três eixos**, não eixo a eixo: um tremor de 0,07 g
+em cada eixo tem módulo real de 0,12 g e não pode ser descartado três vezes.
+
+### 2. Terapia
+
+```
+CR_CYCLE_MS   667 ms    ciclo de ~1,5 Hz
+CR_BURST_MS   100 ms    duração do pulso de cada dedo
+CR_BURST_DUTY 200/255   ~78% de intensidade
+CR_JITTER_MS  ±15 ms    jitter temporal
+ciclagem      3 ON / 2 OFF
+```
+
+Cada dedo pulsa **uma vez por ciclo**, em ordem sorteada (Fisher-Yates) com
+jitter temporal. A cada 3 ciclos estimulando vêm 2 em silêncio — a pausa faz
+parte do protocolo, é ela que dá tempo à rede de expressar a dessincronização.
+
+### 3. O ciclo medir / tratar
+
+Este é o ponto mais importante do projeto, e o menos óbvio.
+
+**O acelerômetro está na mesma luva que os motores.** Se ele continuasse medindo
+durante a terapia, mediria a própria vibração — e a luva se auto-detectaria,
+mantendo a terapia ligada para sempre. Por isso existe uma máquina de estados:
+
+```
+MEDINDO  ──detectou tremor──▶  TRATANDO  ──6,7 s──▶  ASSENTANDO  ──250 ms──┐
+   ▲                                                                        │
+   └────────────────────────────────────────────────────────────────────────┘
+     (buffer é descartado e reenchido do zero: 2,56 s)
+```
+
+- **MEDINDO** — motores parados, buffer sendo alimentado, análise rodando
+- **TRATANDO** — padrão CR nos motores; o buffer **não** recebe amostras
+- **ASSENTANDO** — motores desligados, esperando o ERM parar de girar
+
+Além disso, o filtro passa-baixa interno do MPU6050 é configurado em **20 Hz**.
+Sem ele o sensor responderia até 260 Hz, e como amostramos a 50 Hz (Nyquist =
+25 Hz), a vibração do ERM (100–250 Hz) dobraria por *aliasing* para dentro da
+faixa 3,5–7 Hz e seria lida como tremor.
+
+### 4. Indicação visual
+
+- **LED de fundo** — brilho proporcional ao tremor detectado (0 a 180)
+- **LED em 255** — este dedo está recebendo o pulso CR agora
+
+Assim dá para distinguir *"detectei tremor"* de *"estou estimulando"*.
+
+---
+
+## Protocolo serial
+
+115200 baud, uma linha por amostra (50 Hz), 7 campos separados por vírgula:
+
+```
+roll,pitch,tX,tY,tZ,tTotal,terapia
+```
+
+| Campo | Unidade | Descrição |
+|---|---|---|
+| `roll`, `pitch` | graus | inclinação (filtro complementar) — só telemetria |
+| `tX`, `tY`, `tZ` | g | amplitude do tremor em cada **eixo do acelerômetro** |
+| `tTotal` | g | módulo dos três eixos; é ele que aciona a terapia |
+| `terapia` | 0/1 | 1 enquanto o padrão CR está rodando |
+
+Dois detalhes que confundem quem lê pela primeira vez:
+
+- **`tX`/`tY`/`tZ` são eixos, não dedos.** A luva tem um MPU só: mede a mão
+  inteira e não tem como saber qual dedo está tremendo.
+- **Durante a terapia os valores ficam congelados** no último medido, por causa
+  do blanking descrito acima. O campo `terapia` diz quando isso está valendo.
+
+No boot o firmware também imprime mensagens de diagnóstico que **não** seguem
+esse formato (teste sequencial, offsets de calibração, erros de I2C). Qualquer
+consumidor deve descartar linhas com menos de 7 campos.
+
+---
+
+## Visualização
+
+`visualizacao/visuLuvinha/` é um sketch em Processing que mostra a mão em 3D,
+as barras de amplitude por eixo com a marca do limiar, o histórico dos últimos
+4 s e o estado da terapia.
+
+A porta serial é detectada automaticamente (procura `ttyUSB`, `ttyACM`, `COM`).
+Para forçar uma porta específica, mude `PORTA_IDX` no topo do arquivo.
+
+> Se o Monitor Serial do Arduino IDE estiver aberto, a porta fica ocupada e o
+> Processing não consegue abri-la. Feche um antes de rodar o outro.
+
+---
+
+## Como rodar
+
+```bash
+./abrir-projeto.sh
+```
+
+Abre o firmware no Arduino IDE 2 e a visualização no Processing de uma vez. Os
+caminhos dos dois programas estão no topo do script.
+
+**Dependências do firmware:** biblioteca `MPU6050` (Electronic Cats / jrowberg)
+e o core `esp32` da Espressif. Placa: ESP32 Dev Module.
+
+### No primeiro boot, o que esperar
+
+1. **Teste sequencial (~15 s)** — liga cada LED e cada motor um de cada vez,
+   imprimindo nome e pino no Serial. Serve para isolar problema de fiação por
+   canal de problema de alimentação compartilhada.
+2. **Calibração** — mantenha a luva **parada** apoiada numa superfície firme. Se
+   o firmware detectar movimento (excursão acima de 0,05 g), avisa e repete até
+   3 vezes.
+3. **Operação** — a partir daí, ciclos de medição e terapia.
+
+Se o MPU6050 não responder, o LED do mindinho pisca continuamente em vez de a
+placa travar em silêncio.
+
+---
+
+## Limitações conhecidas
+
+**Motores ERM, não LRA.** No ERM a frequência de vibração está acoplada à
+tensão: não dá para fixá-la. A literatura de vCR usa atuadores com frequência
+controlada (~250 Hz), o que exigiria LRA. Esta é a diferença mais relevante em
+relação aos estudos publicados.
+
+**Um único acelerômetro.** A luva mede o tremor da mão como um todo. Detecção
+por dedo exigiria um sensor por dedo.
+
+**Latência de resposta.** Da parada do tremor até a terapia soltar passa-se o
+bloco em curso (até 6,7 s) mais o reenchimento da janela (2,56 s).
+
+**Sem validação clínica.** Os parâmetros vieram da literatura e de simulação. A
+eficácia real não foi medida.
+
+---
+
+## Referências
+
+Confira cada citação antes de usar em trabalho acadêmico — a lista abaixo é um
+ponto de partida, não uma bibliografia verificada.
+
+- **Tass, P. A. (2003).** *Biological Cybernetics.* Artigo teórico original que
+  propõe o Coordinated Reset.
+- **Syrkin-Nikolau, J. et al. / Bronte-Stewart, H. (2018).** *Movement
+  Disorders.* CR vibrotátil com melhora prolongada no Parkinson (Stanford).
+- **Pfeifer, K. J. et al., incl. Tass, P. A. (2021).** *Frontiers in
+  Physiology.* "Coordinated Reset Vibrotactile Stimulation Induces Sustained
+  Cumulative Benefits in Parkinson's Disease" — o trabalho mais próximo deste
+  projeto: luva vibrotátil e benefício cumulativo.
+- **Cala Trio (Cala Health).** Pulseira com autorização da FDA, mas para *tremor
+  essencial* e por estimulação *elétrica*. Mecanismo diferente, útil como
+  comparação.
+- **GyroGear / GyroGlove.** Luva giroscópica: estabiliza mecanicamente em vez de
+  tratar.
+
+---
+
+## Estrutura
+
+```
+sketch_tremor_FINAL222.ino          firmware do ESP32
+visualizacao/visuLuvinha/           visualização em Processing
+abrir-projeto.sh                    abre os dois de uma vez
+```
