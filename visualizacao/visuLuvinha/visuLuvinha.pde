@@ -30,7 +30,7 @@ final int PORTA_IDX = -1;
 // --- LIMIARES (espelham o .ino) ---
 final float LIMIAR_FORCA   = 0.08;   // TREMOR_MIN_G
 final float LIMIAR_PUREZA  = 0.50;   // DOMINANCE_MIN
-final float LIMIAR_NITIDEZ = 3.50;   // NITIDEZ_MIN
+final float LIMIAR_NITIDEZ = 3.20;   // NITIDEZ_MIN
 final float T_MAX          = 1.00;   // fundo de escala das barras de forca
 final int   SEM_DADOS_MS   = 1000;
 
@@ -73,7 +73,7 @@ color FUNDO       = color(14, 14, 22);
 color FUNDO_PAINEL= color(22, 22, 34);
 color PELE        = color(228, 178, 118);
 color PELE_CLARA  = color(240, 196, 140);
-color TREMOR_COR  = color(255, 70, 70);
+color TREMOR_COR  = color(206, 96, 88);   // vermelho terroso, nao berrante
 color VERDE       = color(70, 220, 130);
 color AMBAR       = color(255, 175, 60);
 color AZUL        = color(120, 200, 255);
@@ -91,6 +91,7 @@ final String[] CANAIS = {
 void setup() {
   size(1100, 700, P3D);
   textFont(createFont("Monospaced", 12));
+  sphereDetail(12);       // baixo de proposito: combina com as caixas
 
   String[] portas = Serial.list();
   println("Portas disponiveis:");
@@ -179,8 +180,9 @@ void cena3D(boolean conectado) {
   for (int i = -400; i <= 400; i += 50) line(i, 190, -250, i, 190, 250);
   for (int j = -250; j <= 250; j += 50) line(-400, 190, j, 400, 190, j);
 
-  ambientLight(90, 90, 110);
-  directionalLight(255, 255, 255, -0.5, 1, -1);
+  ambientLight(96, 96, 116);
+  directionalLight(215, 210, 205, -0.45, 1.0, -0.75);   // luz principal
+  directionalLight(70, 75, 95, 0.6, -0.3, 0.8);         // preenchimento frio
 
   rotateX(radians(-pitchS));
   rotateZ(radians(-rollS));
@@ -210,56 +212,108 @@ void cena3D(boolean conectado) {
 // A mao inteira e' colorida por tTotal: com um unico acelerometro nao da para
 // atribuir tremor a um dedo especifico, entao colorir dedo a dedo seria
 // inventar informacao que a luva nao tem.
+//
+// O tom so comeca a mudar ACIMA do limiar, e para num vermelho terroso a meio
+// caminho da pele. Antes ia direto ao vermelho vivo e a mao inteira acendia com
+// tremor moderado, o que ficava alarmista demais para o que estava sendo medido.
 void desenhaMao(boolean conectado) {
   noStroke();
 
   boolean aoVivo = conectado && estado == MEDINDO;
-  float intensidade = aoVivo ? norm01(tTs) : 0;
-  color corMao   = lerpColor(PELE, TREMOR_COR, intensidade);
-  color corPunho = lerpColor(PELE_CLARA, TREMOR_COR, intensidade * 0.7);
-  if (!conectado) { corMao = color(88, 88, 100); corPunho = color(104, 104, 118); }
-  if (estado == TERAPIA) {                      // terapia: mao marcada em azul
-    corMao   = lerpColor(PELE, AZUL, 0.45);
-    corPunho = lerpColor(PELE_CLARA, AZUL, 0.35);
+  float t = 0;
+  if (aoVivo && tTs > LIMIAR_FORCA)
+    t = map(constrain(tTs, LIMIAR_FORCA, T_MAX), LIMIAR_FORCA, T_MAX, 0, 0.55);
+
+  color corMao   = lerpColor(PELE, TREMOR_COR, t);
+  color corPunho = lerpColor(PELE_CLARA, TREMOR_COR, t * 0.7);
+  if (!conectado) { corMao = color(92, 92, 104); corPunho = color(108, 108, 122); }
+  if (estado == TERAPIA) {
+    corMao   = lerpColor(PELE, AZUL, 0.40);
+    corPunho = lerpColor(PELE_CLARA, AZUL, 0.30);
   }
 
+  // Antebraco, afinando em direcao ao punho
   fill(corPunho);
-  pushMatrix(); translate(-110, 0, 0); box(60, 28, 74); popMatrix();
+  pushMatrix();
+  translate(-128, 0, 0);  box(54, 30, 66);
+  popMatrix();
+  pushMatrix();
+  translate(-88, 0, 0);   box(34, 25, 76);      // punho, mais estreito
+  popMatrix();
 
+  // Palma: mais larga que grossa
   fill(corMao);
-  box(160, 24, 110);
+  pushMatrix();
+  translate(-8, 0, 0);
+  box(140, 19, 104);
+  popMatrix();
 
-  float curva = radians(7 + intensidade * 22);
-  desenhaDedo(-40, 68, corMao, curva);
-  desenhaDedo(-13, 88, corMao, curva);
-  desenhaDedo( 13, 95, corMao, curva);
-  desenhaDedo( 40, 82, corMao, curva);
+  // Base do polegar (tenar), o volume da palma abaixo do dedao
+  pushMatrix();
+  translate(6, 2, 42);
+  box(76, 22, 30);
+  popMatrix();
+
+  // Curvatura natural dos dedos. Antes ia a 29 graus por junta (87 no total) e
+  // a mao virava garra; agora fica numa dobra relaxada, com variacao discreta.
+  float curva = radians(9 + t * 12);
+
+  desenhaDedo(-40, 66, corMao, curva, 0.86);   // mindinho, mais fino e curto
+  desenhaDedo(-14, 86, corMao, curva, 0.96);   // nervo tras
+  desenhaDedo( 13, 92, corMao, curva, 1.00);   // nervo frente
+  desenhaDedo( 39, 84, corMao, curva, 0.96);   // indicador
+
+  desenhaPolegar(corMao, curva);
+}
+
+// Um dedo com tres falanges que afinam para a ponta, com no na base e junta
+// entre as falanges. 'escala' ajusta a espessura por dedo.
+void desenhaDedo(float baseZ, float comprimento, color cor, float curva, float escala) {
+  float[] prop = {0.40, 0.33, 0.27};          // proporcao de cada falange
+  float[] alt  = {14.5, 13.0, 11.4};          // espessura vertical
+  float[] larg = {16.5, 14.8, 13.0};          // largura
 
   pushMatrix();
-  translate(33, 0, 57);
-  rotateY(radians(-48));
-  fill(corMao);
-  float[] segPol = {37, 33};
-  for (int s = 0; s < 2; s++) {
-    rotateZ(radians(6));
-    translate(segPol[s] / 2, 0, 0);
-    box(segPol[s], 17, 20);
-    translate(segPol[s] / 2, 0, 0);
+  translate(62, -1, baseZ);
+  fill(cor);
+
+  // No do dedo, onde ele encontra a palma
+  pushMatrix(); scale(1, 0.85, 1); sphere(9.0 * escala); popMatrix();
+
+  for (int i = 0; i < 3; i++) {
+    rotateZ(curva);
+    float seg = comprimento * prop[i];
+    translate(seg / 2, 0, 0);
+    box(seg, alt[i] * escala, larg[i] * escala);
+    translate(seg / 2, 0, 0);
+    // Junta entre as falanges (a ultima nao leva: e' a ponta do dedo)
+    if (i < 2) {
+      pushMatrix(); scale(1, 0.85, 1); sphere(alt[i] * escala * 0.46); popMatrix();
+    }
   }
   popMatrix();
 }
 
-void desenhaDedo(float baseZ, float comprimento, color cor, float curva) {
-  float[] prop = {0.42, 0.32, 0.26};
+// Polegar: sai da lateral da palma em diagonal, com duas falanges e uma
+// oposicao mais aberta que os outros dedos.
+void desenhaPolegar(color cor, float curva) {
   pushMatrix();
-  translate(78, -1, baseZ);
+  translate(30, 1, 56);
+  rotateY(radians(-52));
+  rotateZ(radians(-6));
   fill(cor);
-  for (int s = 0; s < 3; s++) {
-    rotateZ(curva);
-    float seg = comprimento * prop[s];
-    translate(seg / 2, 0, 0);
-    box(seg, 14, 17);
-    translate(seg / 2, 0, 0);
+
+  pushMatrix(); scale(1, 0.85, 1); sphere(10.5); popMatrix();
+
+  float[] seg = {36, 30};
+  float[] alt = {17.0, 15.0};
+  float[] lar = {19.0, 16.5};
+  for (int i = 0; i < 2; i++) {
+    rotateZ(curva * 0.8);
+    translate(seg[i] / 2, 0, 0);
+    box(seg[i], alt[i], lar[i]);
+    translate(seg[i] / 2, 0, 0);
+    if (i < 1) { pushMatrix(); scale(1, 0.85, 1); sphere(alt[i] * 0.46); popMatrix(); }
   }
   popMatrix();
 }

@@ -78,13 +78,17 @@ const int   CALIB_TENTATIVAS  = 3;
 //   golpe espalha energia por toda a faixa, e a razão cai.
 //   Medido em simulação: tremor sustentado de 4 a 6 Hz dá 4,6 de forma bem
 //   estável; digitar com o jitter natural de quem digita dá 2,2, batidas na
-//   mesa dão 2,4. Daí o limiar em 3,5, no meio dos dois grupos.
+//   mesa dão 2,4.
+//   O limiar começou em 3,50, no meio dos dois grupos, mas na luva real um
+//   tremor de mão legítimo mediu 3,30 e ficava barrado: mão humana não é uma
+//   senoide perfeita, a amplitude varia ao longo dos 2,56 s da janela e isso
+//   espalha um pouco a energia. Baixado para 3,20 com base nessa medida.
 //   Este critério existe porque digitar são ~5 batidas por segundo — 5 Hz,
 //   bem no meio da faixa de tremor. Sem ele, digitar aciona a terapia.
 //   Diminuir -> aceita tremor mais irregular, e também impactos.
 const float TREMOR_MIN_G   = 0.08;
 const float DOMINANCE_MIN  = 0.50;
-const float NITIDEZ_MIN    = 3.50;
+const float NITIDEZ_MIN    = 3.20;
 
 // Modo diagnóstico: em vez da telemetria CSV, imprime uma linha por análise
 // dizendo os dois valores medidos e QUAL critério barrou. Use com o Monitor
