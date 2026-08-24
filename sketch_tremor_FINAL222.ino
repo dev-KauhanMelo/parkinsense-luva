@@ -38,12 +38,45 @@ const uint32_t WDT_TIMEOUT_MS = 4000;  // watchdog: reinicia se o loop travar
 const float CALIB_MAX_RANGE_G = 0.05;
 const int   CALIB_TENTATIVAS  = 3;
 
-// --- LIMIARES DE DETECÇÃO (em unidades físicas, g) ---
-// Tremor senoidal: a_pico = (2*pi*f)^2 * deslocamento.
-//   ~0,08 g  ≈ tremor de ~0,8 mm a 5 Hz  -> limiar de detecção
-// (O visualizador em Processing usa ~0,60 g como fundo de escala das barras.)
+// ===========================================================================
+// AJUSTE DE SENSIBILIDADE  <<< é aqui que se mexe se a luva estiver disparando
+//                              cedo demais ou tarde demais
+// ===========================================================================
+//
+// São DOIS critérios, e os dois têm que passar ao mesmo tempo. Eles protegem
+// contra coisas diferentes — mexer no errado não resolve.
+//
+// TREMOR_MIN_G  quão FORTE precisa ser o tremor.
+//   Tremor senoidal: a_pico = (2*pi*f)^2 * deslocamento.
+//   0,08 g equivale a um tremor de ~0,8 mm a 5 Hz.
+//   É este critério que barra movimento voluntário lento (acenar a 1,5 Hz,
+//   mesmo com 2 g de amplitude, deixa só 0,08 g na faixa de tremor).
+//   Diminuir -> dispara com tremor mais fraco, e também com mais ruído.
+//
+// DOMINANCE_MIN  quão LIMPO precisa ser o tremor.
+//   Fração da energia que precisa estar em 3,5-7 Hz, e não em 0,5-3 Hz:
+//     0,50 = a faixa de tremor só precisa empatar com a de movimento
+//     0,75 = a faixa de tremor precisa ser 3x maior
+//   É este critério que barra gesto rápido perto da faixa de tremor.
+//   Diminuir -> tolera tremor "sujo", misturado com movimento voluntário.
+//
+// Por que 0,50 e não 0,75 (o valor original):
+//   Sacudir a mão no ar não produz só oscilação — o punho também GIRA, e o
+//   giro redistribui a gravidade (1 g inteiro!) entre os eixos, enchendo a
+//   faixa de 0,5-3 Hz. Medido em simulação, com 0,20 g de tremor e 0,20 g de
+//   giro a dominância fica em 0,51: com o limiar em 0,75 era preciso tremer
+//   ~3x mais forte só para vencer o giro do próprio punho. Já um paciente com
+//   a mão apoiada quase não gira o punho e chega a 0,99 de dominância — ou
+//   seja, o limiar antigo atrapalhava o teste de bancada, não o uso real.
+//   Conferido: nenhum movimento voluntário testado passa de 0,45 de
+//   dominância, então 0,50 continua com margem.
 const float TREMOR_MIN_G   = 0.08;
-const float DOMINANCE_MIN  = 0.75;  // fração da energia que precisa estar na faixa de tremor
+const float DOMINANCE_MIN  = 0.50;
+
+// Modo diagnóstico: em vez da telemetria CSV, imprime uma linha por análise
+// dizendo os dois valores medidos e QUAL critério barrou. Use com o Monitor
+// Serial (o visualizador em Processing não funciona com isto ligado).
+const bool DIAGNOSTICO = false;
 
 // --- BANDAS DE ANÁLISE ---
 // Resolução da janela: Δf = 50/128 = 0,39 Hz. Sondando de 0,5 em 0,5 Hz, um
@@ -71,10 +104,6 @@ const int           CR_CYCLES_OFF = 2;    // ...e 2 em silêncio (Tass)
 const unsigned long BLOCO_TERAPIA_MS = 2 * (CR_CYCLES_ON + CR_CYCLES_OFF) * CR_CYCLE_MS;  // ~6,7 s
 const unsigned long ASSENTAMENTO_MS  = 250;   // espera o motor parar de girar antes de medir
 
-// --- LEDS ---
-const float ESCALA_MAX_G   = 0.60;  // fundo de escala do brilho (mesmo do visualizador)
-const int   LED_BRILHO_MAX = 180;   // teto do brilho de fundo; o pulso CR vai a 255
-
 float bufferX[BUFFER_SIZE];
 float bufferY[BUFFER_SIZE];
 float bufferZ[BUFFER_SIZE];
@@ -94,6 +123,8 @@ float offsetGX = 0, offsetGY = 0;   // bias do giroscópio, em graus/s
 
 // Valores de tremor (amplitude em g da frequência dominante) persistem entre ciclos
 float tX = 0, tY = 0, tZ = 0, tTotal = 0;
+// Última análise, guardada para o modo diagnóstico
+float ultVolTotal = 0, ultDominancia = 0;
 
 // --- ESTADO: MEDINDO -> TRATANDO -> ASSENTANDO -> MEDINDO ---
 // MEDINDO     motores parados, buffer sendo preenchido, análise rodando
@@ -282,7 +313,34 @@ bool analisaTremor(int start) {
   if (volTotal < 0.001) volTotal = 0.001;
 
   float dominancia = tTotal / (tTotal + volTotal);
+
+  ultVolTotal   = volTotal;
+  ultDominancia = dominancia;
+
   return (tTotal >= TREMOR_MIN_G && dominancia >= DOMINANCE_MIN);
+}
+
+// --- DIAGNÓSTICO ---
+// Uma linha por análise dizendo os dois valores medidos e qual critério barrou.
+// Sem vírgulas de propósito: se sobrar alguma linha destas no meio da
+// telemetria, o visualizador a descarta em vez de tentar interpretá-la.
+void imprimeDiagnostico(bool disparou) {
+  bool ampOk = (tTotal        >= TREMOR_MIN_G);
+  bool domOk = (ultDominancia >= DOMINANCE_MIN);
+
+  Serial.print("# tremor=");  Serial.print(tTotal, 3);
+  Serial.print(" g  vol=");   Serial.print(ultVolTotal, 3);
+  Serial.print(" g  dom=");   Serial.print(ultDominancia, 2);
+  Serial.print("   amplitude(>=");  Serial.print(TREMOR_MIN_G, 2);
+  Serial.print(")=");               Serial.print(ampOk ? "ok " : "NAO");
+  Serial.print("  dominancia(>=");  Serial.print(DOMINANCE_MIN, 2);
+  Serial.print(")=");               Serial.print(domOk ? "ok " : "NAO");
+  Serial.print("  -> ");
+
+  if (disparou)      Serial.println("DISPARA");
+  else if (!ampOk && !domOk) Serial.println("parado: fraco e sujo demais");
+  else if (!ampOk)   Serial.println("parado: tremor fraco demais");
+  else               Serial.println("parado: movimento voluntario demais na faixa 0.5-3 Hz");
 }
 
 // --- EMBARALHA A ORDEM DOS DEDOS E APLICA JITTER TEMPORAL (CR) ---
@@ -351,15 +409,14 @@ void updateCR(bool active) {
   }
 }
 
-// --- LEDS: INDICADOR DE DETECÇÃO + MARCADOR DO PULSO CR ---
-// Brilho de fundo proporcional ao tremor medido (o que o commit original
-// prometia e nunca foi implementado: antes os LEDs só copiavam os motores,
-// então não dava para distinguir "detectei" de "estou estimulando").
-// O dedo que está recebendo o pulso CR vai a 255 e se destaca do fundo.
+// --- LEDS: ESPELHO DOS MOTORES ---
+// Cada LED representa o motor do seu dedo e mais nada: acende junto com o
+// pulso CR, apaga junto. (Chegou a existir aqui um brilho de fundo
+// proporcional ao tremor medido, mas na bancada ele acendia com qualquer
+// movimentinho e mais atrapalhava do que ajudava a ler o que a luva faz.)
 void atualizaLeds() {
-  int base = (int)(constrain(tTotal / ESCALA_MAX_G, 0.0f, 1.0f) * LED_BRILHO_MAX);
   for (int i = 0; i < 5; i++) {
-    int alvo = (crLast[i] > 0) ? 255 : base;
+    int alvo = (crLast[i] > 0) ? 255 : 0;
     if (alvo != ledLast[i]) {
       ledcWrite(PINOS[i], alvo);
       ledLast[i] = alvo;
@@ -578,21 +635,27 @@ void loop() {
       if (bufferReady && stepCounter >= STEP) {
         stepCounter = 0;
         int start = bufferIndex;   // posição mais antiga do buffer circular
-        if (analisaTremor(start)) trocaEstado(TRATANDO, now);
+        bool disparou = analisaTremor(start);
+        if (DIAGNOSTICO) imprimeDiagnostico(disparou);
+        if (disparou) trocaEstado(TRATANDO, now);
       }
     }
 
-    // Serial não bloqueia nunca. Campos: roll,pitch,tX,tY,tZ,tTotal,terapia(0/1)
-    // A linha completa chega a ~48 bytes ("-179.99,-179.99,0.1234,...,1\n"), então
-    // 44 era folga insuficiente: com 45 bytes livres passava no teste e travava.
-    if (Serial.availableForWrite() > 64) {
+    // Serial não bloqueia nunca.
+    // Campos: roll,pitch,tX,tY,tZ,tTotal,terapia(0/1),dominancia
+    // A dominância vai junto para o painel poder dizer qual dos dois critérios
+    // barrou. Sem ela o visualizador só via a amplitude e anunciava "TREMOR
+    // ACIMA DO LIMIAR" mesmo quando o firmware tinha decidido que não era.
+    // A linha completa chega a ~55 bytes; 64 de folga cobre com margem.
+    if (!DIAGNOSTICO && Serial.availableForWrite() > 64) {
       Serial.print(roll, 2);   Serial.print(",");
       Serial.print(pitch, 2);  Serial.print(",");
       Serial.print(tX, 4);     Serial.print(",");
       Serial.print(tY, 4);     Serial.print(",");
       Serial.print(tZ, 4);     Serial.print(",");
       Serial.print(tTotal, 4); Serial.print(",");
-      Serial.println(estado == TRATANDO ? 1 : 0);
+      Serial.print(estado == TRATANDO ? 1 : 0); Serial.print(",");
+      Serial.println(ultDominancia, 3);
     }
   }
 }

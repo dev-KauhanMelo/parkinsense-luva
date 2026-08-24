@@ -29,8 +29,10 @@ boolean semPorta = false;
 final int PORTA_IDX = -1;
 
 // --- ESCALA DOS DADOS (tem que bater com o firmware) ---
-final float LIMIAR_TREMOR = 0.08;   // TREMOR_MIN_G  do .ino
-final float T_MAX         = 0.60;   // ESCALA_MAX_G  do .ino
+final float LIMIAR_TREMOR = 0.08;   // TREMOR_MIN_G   do .ino
+final float LIMIAR_DOM    = 0.50;   // DOMINANCE_MIN  do .ino
+final float T_MAX         = 1.00;   // fundo de escala das barras (um sacudir
+                                    // forte chega perto de 1 g)
 final int   SEM_DADOS_MS  = 1000;   // silencio maior que isso = cabo caiu
 
 // ---------------------------------------------------------------------------
@@ -42,7 +44,7 @@ final int   SEM_DADOS_MS  = 1000;   // silencio maior que isso = cabo caiu
 // ---------------------------------------------------------------------------
 final Object trava = new Object();
 
-float sRoll, sPitch, sX, sY, sZ, sT;
+float sRoll, sPitch, sX, sY, sZ, sT, sDom;
 boolean sTerapia = false;
 int sUltimaLinha = 0;         // millis() da ultima linha valida
 int sLinhasOk = 0, sLinhasRuins = 0;
@@ -56,7 +58,7 @@ boolean[] sHistTerapia = new boolean[HIST];
 int sHistIdx = 0;
 
 // --- copias locais do draw (nunca tocadas pela thread da serial) ---
-float roll, pitch, tX, tY, tZ, tTotal;
+float roll, pitch, tX, tY, tZ, tTotal, dominancia;
 boolean terapiaAtiva = false;
 int ultimaLinha = 0, linhasOk = 0, linhasRuins = 0;
 float[] histX = new float[HIST], histY = new float[HIST];
@@ -159,7 +161,7 @@ void draw() {
 void copiaEstado() {
   synchronized (trava) {
     roll = sRoll;  pitch = sPitch;
-    tX = sX;  tY = sY;  tZ = sZ;  tTotal = sT;
+    tX = sX;  tY = sY;  tZ = sZ;  tTotal = sT;  dominancia = sDom;
     terapiaAtiva = sTerapia;
     ultimaLinha = sUltimaLinha;
     linhasOk = sLinhasOk;  linhasRuins = sLinhasRuins;
@@ -299,11 +301,39 @@ void desenhaHUD(boolean conectado) {
   text("Roll  " + nf(rollS,  1, 1) + " graus", x, y);       y += 18;
   text("Pitch " + nf(pitchS, 1, 1) + " graus", x, y);       y += 28;
 
-  // --- status do tremor ---
-  boolean temTremor = conectado && tTotal >= LIMIAR_TREMOR;
-  fill(temTremor ? TREMOR_COR : color(60, 255, 120));
-  text(temTremor ? "TREMOR ACIMA DO LIMIAR" : "Abaixo do limiar", x, y);
-  y += 20;
+  // --- os DOIS criterios de disparo ---
+  // O firmware so aciona a terapia quando amplitude E dominancia passam.
+  // Mostrar apenas a amplitude (como este painel fazia antes) anunciava
+  // "TREMOR ACIMA DO LIMIAR" em situacoes que o firmware descartava, o que
+  // dava a impressao de que os motores estavam falhando.
+  boolean ampOk = conectado && tTotal     >= LIMIAR_TREMOR;
+  boolean domOk = conectado && dominancia >= LIMIAR_DOM;
+
+  fill(ampOk ? color(60, 255, 120) : TEXTO_FRACO);
+  text((ampOk ? "[ok]   " : "[nao]  ") + "forca      " +
+       nf(tTotal, 1, 3) + " g  (min " + nf(LIMIAR_TREMOR, 1, 2) + ")", x, y);
+  y += 18;
+
+  fill(domOk ? color(60, 255, 120) : TEXTO_FRACO);
+  text((domOk ? "[ok]   " : "[nao]  ") + "pureza     " +
+       nf(dominancia, 1, 2) + "    (min " + nf(LIMIAR_DOM, 1, 2) + ")", x, y);
+  y += 22;
+
+  if (ampOk && domOk) {
+    fill(TREMOR_COR);
+    text("TREMOR DETECTADO", x, y);
+  } else if (ampOk) {
+    // O caso que mais confunde na bancada: forca sobra, o que falta e' pureza.
+    fill(255, 170, 60);
+    text("nao aciona: movimento lento demais junto", x, y);
+    y += 16;
+    fill(TEXTO_FRACO);
+    text("(o punho girando joga a gravidade na faixa 0,5-3 Hz)", x, y);
+  } else {
+    fill(60, 255, 120);
+    text("em repouso", x, y);
+  }
+  y += 24;
 
   // --- estado do firmware ---
   // A flag da terapia diz em qual fase do ciclo medir/tratar a luva esta.
@@ -331,8 +361,10 @@ void desenhaHUD(boolean conectado) {
   desenhaBarra("Z", tZs, tZ, COR_Z,     x, y);       y += 24;
   desenhaBarra("|T|", tTs, tTotal, COR_TOTAL, x, y); y += 30;
 
+  desenhaBarraPureza(x, y);  y += 30;
+
   fill(TEXTO_FRACO);
-  text("|T| = modulo dos tres eixos; e' ele que aciona a terapia.", x, y);
+  text("|T| = modulo dos tres eixos. Aciona a terapia so com pureza ok.", x, y);
   y += 16;
   text("A luva tem um MPU so: mede a mao inteira, nao dedo a dedo.", x, y);
 
@@ -368,6 +400,32 @@ void desenhaBarra(String rotulo, float suave, float cru, color cor, int x, int y
   text(rotulo, x, y + ALT - 2);
   fill(cru >= LIMIAR_TREMOR ? cor : TEXTO_FRACO);
   text(nf(cru, 1, 3) + " g", bx + LARG + 10, y + ALT - 2);
+}
+
+// Quanto da energia esta na faixa de tremor (3,5-7 Hz) e nao na de movimento
+// voluntario (0,5-3 Hz). E' o segundo criterio de disparo.
+void desenhaBarraPureza(int x, int y) {
+  final int LARG = 300, ALT = 14;
+  int bx = x + 52;
+
+  noStroke();
+  fill(38, 38, 56);
+  rect(bx, y, LARG, ALT, 3);
+
+  boolean ok = dominancia >= LIMIAR_DOM;
+  fill(ok ? color(120, 220, 160) : color(150, 120, 90));
+  rect(bx, y, map(constrain(dominancia, 0, 1), 0, 1, 0, LARG), ALT, 3);
+
+  stroke(255, 255, 255, 130);
+  strokeWeight(1);
+  float xLim = bx + map(LIMIAR_DOM, 0, 1, 0, LARG);
+  line(xLim, y - 1, xLim, y + ALT + 1);
+  noStroke();
+
+  fill(TEXTO);
+  text("pureza", x, y + ALT - 2);
+  fill(ok ? color(120, 220, 160) : TEXTO_FRACO);
+  text(nf(dominancia, 1, 2), bx + LARG + 10, y + ALT - 2);
 }
 
 // Os cinco canais existem no HARDWARE (um motor e um LED por posicao), mas o
@@ -505,10 +563,18 @@ void serialEvent(Serial p) {
   // sempre, inclusive abaixo do limiar, entao tTotal e' quase sempre > 0.
   boolean terapia = (trim(v[6]).equals("1"));
 
+  // 8o campo (dominancia) e' opcional: firmware antigo mandava so 7.
+  float dom = 0;
+  if (v.length >= 8) {
+    dom = float(v[7]);
+    if (Float.isNaN(dom)) dom = 0;
+  }
+
   synchronized (trava) {
     sRoll = r;  sPitch = pt;
     sX = x;  sY = y;  sZ = z;  sT = t;
     sTerapia = terapia;
+    sDom = dom;
     sUltimaLinha = millis();
     sLinhasOk++;
 

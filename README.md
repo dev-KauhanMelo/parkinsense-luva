@@ -91,9 +91,19 @@ específicas:
 O resultado sai direto em **g**, com significado físico. Dispara a terapia
 quando os dois critérios são satisfeitos ao mesmo tempo:
 
-- **amplitude** `|T| ≥ 0,08 g` — equivale a um tremor de ~0,8 mm a 5 Hz
-- **dominância** `≥ 0,75` — a maior parte da energia tem que estar na faixa de
-  tremor, e não na de movimento voluntário
+- **amplitude** `|T| ≥ 0,08 g` — equivale a um tremor de ~0,8 mm a 5 Hz.
+  É este critério que barra movimento voluntário lento.
+- **dominância** `≥ 0,50` — a faixa de tremor precisa ao menos empatar com a de
+  movimento voluntário. É este que barra gesto rápido perto da faixa de tremor.
+
+Os dois valores são publicados na serial, e o painel do Processing mostra qual
+dos dois está barrando. Sacudir a mão no ar costuma passar de sobra na
+amplitude e falhar na dominância: o punho gira junto, e o giro redistribui a
+gravidade pela faixa de 0,5–3 Hz. Com a mão apoiada, como num paciente em
+repouso, isso praticamente não acontece.
+
+Os dois limiares ficam num bloco comentado no topo do `.ino`, com a explicação
+de para que serve cada um.
 
 A decisão usa o **módulo dos três eixos**, não eixo a eixo: um tremor de 0,07 g
 em cada eixo tem módulo real de 0,12 g e não pode ser descartado três vezes.
@@ -138,10 +148,8 @@ faixa 3,5–7 Hz e seria lida como tremor.
 
 ### 4. Indicação visual
 
-- **LED de fundo** — brilho proporcional ao tremor detectado (0 a 180)
-- **LED em 255** — este dedo está recebendo o pulso CR agora
-
-Assim dá para distinguir *"detectei tremor"* de *"estou estimulando"*.
+Cada LED espelha o motor do seu dedo: acende junto com o pulso CR e apaga
+junto. Fora da terapia todos ficam apagados.
 
 ---
 
@@ -150,7 +158,7 @@ Assim dá para distinguir *"detectei tremor"* de *"estou estimulando"*.
 115200 baud, uma linha por amostra (50 Hz), 7 campos separados por vírgula:
 
 ```
-roll,pitch,tX,tY,tZ,tTotal,terapia
+roll,pitch,tX,tY,tZ,tTotal,terapia,dominancia
 ```
 
 | Campo | Unidade | Descrição |
@@ -159,17 +167,24 @@ roll,pitch,tX,tY,tZ,tTotal,terapia
 | `tX`, `tY`, `tZ` | g | amplitude do tremor em cada **eixo do acelerômetro** |
 | `tTotal` | g | módulo dos três eixos; é ele que aciona a terapia |
 | `terapia` | 0/1 | 1 enquanto o padrão CR está rodando |
+| `dominancia` | 0–1 | fração da energia na faixa de tremor (2º critério) |
 
 Dois detalhes que confundem quem lê pela primeira vez:
 
 - **`tX`/`tY`/`tZ` são eixos, não dedos.** A luva tem um MPU só: mede a mão
   inteira e não tem como saber qual dedo está tremendo.
+- **Amplitude alta não significa disparo.** A terapia só liga com os dois
+  critérios satisfeitos; `dominancia` diz se o segundo passou.
 - **Durante a terapia os valores ficam congelados** no último medido, por causa
   do blanking descrito acima. O campo `terapia` diz quando isso está valendo.
 
 No boot o firmware também imprime mensagens de diagnóstico que **não** seguem
 esse formato (teste sequencial, offsets de calibração, erros de I2C). Qualquer
-consumidor deve descartar linhas com menos de 7 campos.
+consumidor deve descartar linhas com menos de 8 campos.
+
+Ligando `DIAGNOSTICO = true` no topo do `.ino`, a telemetria dá lugar a uma
+linha por análise dizendo os valores medidos e qual critério barrou — útil no
+Monitor Serial (o visualizador não funciona nesse modo).
 
 ---
 
