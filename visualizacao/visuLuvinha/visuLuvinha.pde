@@ -1,43 +1,100 @@
 import processing.serial.*;
 
-Serial porta;
-boolean semPorta = false;   // true quando nenhuma porta serial foi encontrada
+// ============================================================================
+// visuLuvinha - visualizacao da luva ParkinSense
+//
+// Formato recebido pela serial, 50 linhas por segundo:
+//   roll,pitch,tX,tY,tZ,tTotal,terapia
+//
+// IMPORTANTE sobre o que cada campo significa:
+//   tX, tY, tZ  sao os EIXOS DO ACELEROMETRO, nao dedos. A luva tem um unico
+//               MPU6050, entao ela mede o tremor da mao inteira e nao tem como
+//               saber qual dedo esta tremendo. (A versao anterior deste sketch
+//               rotulava as barras como "Indicador", "Medio" e "Anelar", o que
+//               dava a impressao errada de medicao por dedo.)
+//   tTotal      modulo do vetor (X,Y,Z): e' este valor que decide a terapia.
+//   terapia     1 enquanto o padrao Coordinated Reset esta rodando.
+//
+// E sobre quando os valores mudam: durante a terapia o firmware PARA de
+// alimentar o buffer de deteccao (blanking), porque o acelerometro estaria
+// medindo a vibracao dos proprios motores. Nesse periodo tX/tY/tZ ficam
+// CONGELADOS no ultimo valor medido - o painel avisa quando isso acontece.
+// ============================================================================
 
-// Índice da porta serial. -1 = detecção automática (prefere ttyUSB/ttyACM/COM);
-// defina um número fixo (0,1,2...) se quiser forçar uma porta específica.
+Serial porta;
+boolean semPorta = false;
+
+// Indice da porta serial. -1 = deteccao automatica (prefere ttyUSB/ttyACM/COM);
+// defina um numero fixo (0,1,2...) para forcar uma porta especifica.
 final int PORTA_IDX = -1;
 
-// --- ESCALA DOS DADOS ---
-// O firmware (Goertzel normalizado) envia amplitudes em unidades de g:
-// limiar de detecção = 0.08 g e fundo de escala útil ~0.60 g.
-// Formato Serial: roll,pitch,tX,tY,tZ,tTotal,terapia(0/1)
-final float LIMIAR_TREMOR = 0.08;  // mesmo limiar de detecção do firmware
-final float T_MAX         = 0.6;   // fundo de escala de barras e gráfico
+// --- ESCALA DOS DADOS (tem que bater com o firmware) ---
+final float LIMIAR_TREMOR = 0.08;   // TREMOR_MIN_G  do .ino
+final float T_MAX         = 0.60;   // ESCALA_MAX_G  do .ino
+final int   SEM_DADOS_MS  = 1000;   // silencio maior que isso = cabo caiu
 
-float roll = 0, pitch = 0;
-float tX = 0, tY = 0, tZ = 0, tTotal = 0;
-float rollS = 0, pitchS = 0;
-float tXs = 0, tYs = 0, tZs = 0, tTs = 0;
-boolean terapiaAtiva = false;   // vem do 7º campo (modo Coordinated Reset)
+// ---------------------------------------------------------------------------
+// ESTADO COMPARTILHADO ENTRE AS DUAS THREADS
+// serialEvent() roda na thread da serial e draw() na thread do sketch. Antes
+// as duas mexiam nas mesmas variaveis sem protecao, o que podia entregar ao
+// desenho um quadro com metade dos campos do frame anterior. Tudo que cruza as
+// threads agora passa por este bloco, sempre sob o mesmo lock.
+// ---------------------------------------------------------------------------
+final Object trava = new Object();
 
-int HIST = 200;
-float[] histX   = new float[HIST];
-float[] histY   = new float[HIST];
-float[] histZ   = new float[HIST];
-float[] histAll = new float[HIST];
+float sRoll, sPitch, sX, sY, sZ, sT;
+boolean sTerapia = false;
+int sUltimaLinha = 0;         // millis() da ultima linha valida
+int sLinhasOk = 0, sLinhasRuins = 0;
+
+final int HIST = 200;         // 200 amostras a 50 Hz = 4 s de historico
+float[] sHistX   = new float[HIST];
+float[] sHistY   = new float[HIST];
+float[] sHistZ   = new float[HIST];
+float[] sHistT   = new float[HIST];
+boolean[] sHistTerapia = new boolean[HIST];
+int sHistIdx = 0;
+
+// --- copias locais do draw (nunca tocadas pela thread da serial) ---
+float roll, pitch, tX, tY, tZ, tTotal;
+boolean terapiaAtiva = false;
+int ultimaLinha = 0, linhasOk = 0, linhasRuins = 0;
+float[] histX = new float[HIST], histY = new float[HIST];
+float[] histZ = new float[HIST], histT = new float[HIST];
+boolean[] histTerapia = new boolean[HIST];
 int histIdx = 0;
 
-// --- CORES DA MÃO ---
+// --- valores suavizados, so para a animacao ---
+float rollS = 0, pitchS = 0;
+float tXs = 0, tYs = 0, tZs = 0, tTs = 0;
+
+// --- CORES ---
+color FUNDO      = color(15, 15, 25);
 color PELE       = color(228, 178, 118);
 color PELE_CLARA = color(240, 196, 140);
 color TREMOR_COR = color(255, 60, 60);
+color COR_X      = color(255, 90,  90);
+color COR_Y      = color(90,  255, 120);
+color COR_Z      = color(110, 150, 255);
+color COR_TOTAL  = color(255, 200, 50);
+color COR_TERAPIA= color(120, 200, 255);
+color TEXTO      = color(225, 225, 235);
+color TEXTO_FRACO= color(140, 140, 160);
+
+// Os cinco canais fisicos da luva, na ordem do firmware (PINOS[0..4]).
+final String[] CANAIS = {
+  "Polegar", "Indicador", "Nervo frente", "Nervo tras", "Mindinho"
+};
+
+PFont fonte;
 
 void setup() {
-  size(800, 600, P3D);
-  textFont(createFont("Monospaced", 12));
+  size(900, 640, P3D);
+  fonte = createFont("Monospaced", 12);
+  textFont(fonte);
 
   String[] portas = Serial.list();
-  println("Portas disponíveis:");
+  println("Portas disponiveis:");
   printArray(portas);
 
   if (portas.length == 0) {
@@ -48,12 +105,22 @@ void setup() {
 
   int idx = (PORTA_IDX >= 0 && PORTA_IDX < portas.length) ? PORTA_IDX : escolhePorta(portas);
   println("Usando porta: " + portas[idx]);
-  porta = new Serial(this, portas[idx], 115200);
-  porta.bufferUntil('\n');
+
+  // Abrir a porta pode falhar (ocupada pelo Monitor Serial do Arduino IDE, sem
+  // permissao no grupo dialout...). Sem o try o sketch morria com stack trace.
+  try {
+    porta = new Serial(this, portas[idx], 115200);
+    porta.clear();                 // descarta o meio-pacote que ja estava no buffer
+    porta.bufferUntil('\n');
+  } catch (Exception e) {
+    println("ERRO ao abrir " + portas[idx] + ": " + e.getMessage());
+    println("A porta esta ocupada? Feche o Monitor Serial do Arduino IDE.");
+    semPorta = true;
+  }
 }
 
-// Detecta automaticamente a porta do ESP32 (ttyUSB/ttyACM no Linux,
-// tty.usb/cu.usb no macOS, COM no Windows). Cai no índice 0 se não achar.
+// Detecta a porta do ESP32 (ttyUSB/ttyACM no Linux, tty.usb/cu.usb no macOS,
+// COM no Windows). Cai no indice 0 se nao achar nenhuma pista.
 int escolhePorta(String[] portas) {
   String[] pistas = {"ttyUSB", "ttyACM", "tty.usb", "cu.usb", "COM"};
   for (String pista : pistas)
@@ -62,32 +129,57 @@ int escolhePorta(String[] portas) {
   return 0;
 }
 
+// ============================================================================
 void draw() {
-  background(15, 15, 25);
+  background(FUNDO);
 
-  // Sem porta serial: mostra aviso em vez de travar
   if (semPorta) {
-    fill(255, 90, 90);
-    textAlign(CENTER, CENTER);
-    text("Nenhuma porta serial encontrada.\nConecte o ESP32 e reinicie o sketch.",
-         width / 2, height / 2);
-    textAlign(LEFT, BASELINE);
+    desenhaAvisoSemPorta();
     return;
   }
 
-  // Suavização com tratamento de volta em ±180° (evita o giro "pelo caminho longo")
+  copiaEstado();
+
+  boolean conectado = (millis() - ultimaLinha) < SEM_DADOS_MS && linhasOk > 0;
+
+  // Suavizacao so para a animacao; os numeros exibidos sao os valores crus.
   rollS  = suavizaAngulo(rollS,  roll,  0.15);
   pitchS = suavizaAngulo(pitchS, pitch, 0.15);
-  tXs    += (tX     - tXs) * 0.2;
-  tYs    += (tY     - tYs) * 0.2;
-  tZs    += (tZ     - tZs) * 0.2;
-  tTs    += (tTotal - tTs) * 0.2;
+  tXs += (tX     - tXs) * 0.2;
+  tYs += (tY     - tYs) * 0.2;
+  tZs += (tZ     - tZs) * 0.2;
+  tTs += (tTotal - tTs) * 0.2;
 
-  // ---- Cena 3D (desenhada primeiro; HUD vai por cima no final) ----
+  desenhaCena3D(conectado);
+  desenhaHUD(conectado);
+}
+
+// Le tudo o que veio da serial de uma vez so, sob o lock, e copia para as
+// variaveis locais. Do resto do draw() em diante nada mais cruza threads.
+void copiaEstado() {
+  synchronized (trava) {
+    roll = sRoll;  pitch = sPitch;
+    tX = sX;  tY = sY;  tZ = sZ;  tTotal = sT;
+    terapiaAtiva = sTerapia;
+    ultimaLinha = sUltimaLinha;
+    linhasOk = sLinhasOk;  linhasRuins = sLinhasRuins;
+    histIdx = sHistIdx;
+    arrayCopy(sHistX, histX);
+    arrayCopy(sHistY, histY);
+    arrayCopy(sHistZ, histZ);
+    arrayCopy(sHistT, histT);
+    arrayCopy(sHistTerapia, histTerapia);
+  }
+}
+
+// ============================================================================
+// CENA 3D
+// ============================================================================
+void desenhaCena3D(boolean conectado) {
   pushMatrix();
-  translate(width / 2, height / 2 - 80, 0);
+  translate(width / 2 + 10, height / 2 - 130, 0);
 
-  // Grade do chão: fixa no mundo, não gira com a mão
+  // Grade do chao: fixa no mundo, nao gira com a mao
   stroke(40, 40, 65);
   strokeWeight(1);
   for (int i = -400; i <= 400; i += 50) line(i, 170, -250, i, 170, 250);
@@ -99,100 +191,62 @@ void draw() {
   rotateX(radians(-pitchS));
   rotateZ(radians(-rollS));
 
-  // Vibração visual proporcional ao tremor
-  if (tTs > LIMIAR_TREMOR) {
-    float shake = map(constrain(tTs, LIMIAR_TREMOR, 1.0), LIMIAR_TREMOR, 1.0, 0.5, 5.0);
+  // Vibracao visual proporcional ao tremor. Usa T_MAX como teto, igual as
+  // barras e ao grafico - antes o teto aqui era 1.0 e o das barras 0.6, entao
+  // a mao parecia tremer menos do que as barras indicavam.
+  if (conectado && tTs > LIMIAR_TREMOR) {
+    float shake = map(constrain(tTs, LIMIAR_TREMOR, T_MAX), LIMIAR_TREMOR, T_MAX, 0.5, 6.0);
     translate(random(-shake, shake), random(-shake, shake), random(-shake, shake));
   }
 
-  desenhaMao();
+  desenhaMao(conectado);
 
-  // Eixos do corpo (giram junto com a mão)
+  // Eixos do corpo, nas mesmas cores das barras do HUD
   strokeWeight(2);
-  stroke(255, 80, 80);  line(0, 0, 0, 170, 0, 0);
-  stroke(80, 255, 80);  line(0, 0, 0, 0, -150, 0);
-  stroke(80, 80, 255);  line(0, 0, 0, 0, 0, 150);
+  stroke(COR_X);  line(0, 0, 0, 170, 0, 0);
+  stroke(COR_Y);  line(0, 0, 0, 0, -150, 0);
+  stroke(COR_Z);  line(0, 0, 0, 0, 0, 150);
+  strokeWeight(1);
 
   popMatrix();
-
-  // ---- HUD 2D (por cima da cena 3D) ----
-  camera();
-  noLights();
-  hint(DISABLE_DEPTH_TEST);
-
-  fill(255);
-  text("Roll  : " + nf(rollS,  1, 1) + "°", 20, 25);
-  text("Pitch : " + nf(pitchS, 1, 1) + "°", 20, 45);
-
-  boolean temTremor = tTs > LIMIAR_TREMOR;
-  fill(temTremor ? color(255, 60, 60) : color(60, 255, 120));
-  text("Status: " + (temTremor ? "TREMOR DETECTADO" : "Repouso"), 20, 70);
-
-  // Estado da terapia CR (7º campo). Ponto pisca a ~1,5 Hz imitando o ciclo CR.
-  boolean crPulse = (millis() % 667) < 100;
-  fill(terapiaAtiva ? (crPulse ? color(120, 200, 255) : color(60, 110, 150))
-                    : color(90, 90, 110));
-  text("Terapia CR: " + (terapiaAtiva ? "ATIVA  " + (crPulse ? "●" : "○") : "—"), 300, 70);
-
-  // Barras por eixo
-  desenhaBarraEixo("X (Indicador)", tXs, color(255, 80,  80),  20, 90);
-  desenhaBarraEixo("Y (Medio)    ", tYs, color(80,  255, 80),  20, 115);
-  desenhaBarraEixo("Z (Anelar)   ", tZs, color(80,  80,  255), 20, 140);
-  desenhaBarraEixo("Total(Minimo)", tTs, color(255, 200, 50),  20, 165);
-
-  // Gráfico histórico
-  int gx = 20, gy = 430, gw = 760, gh = 80;
-  fill(20, 20, 35);
-  stroke(50, 50, 80);
-  rect(gx, gy, gw, gh, 4);
-
-  desenhaGrafico(histX,   gx, gy, gw, gh, color(255, 80,  80));
-  desenhaGrafico(histY,   gx, gy, gw, gh, color(80,  255, 80));
-  desenhaGrafico(histZ,   gx, gy, gw, gh, color(80,  80,  255));
-  desenhaGrafico(histAll, gx, gy, gw, gh, color(255, 200, 50));
-
-  fill(150); noStroke();
-  text("Histórico tremor por eixo (3,5-7 Hz)", gx + 5, gy - 5);
-
-  fill(255, 80, 80);   text("■ X", 20,  height - 40);
-  fill(80, 255, 80);   text("■ Y", 60,  height - 40);
-  fill(80, 80, 255);   text("■ Z", 100, height - 40);
-  fill(255, 200, 50);  text("■ Total", 140, height - 40);
-
-  hint(ENABLE_DEPTH_TEST);
 }
 
-// ================= MÃO 3D =================
-// Mão direita deitada, palma para baixo, dedos apontando para +X,
-// polegar para o lado +Z. Cada dedo fica vermelho conforme o tremor
-// do canal correspondente (mesmo mapeamento das barras do HUD).
-void desenhaMao() {
+// Mao direita deitada, palma para baixo, dedos apontando para +X.
+// A mao inteira e' colorida por tTotal: com um unico acelerometro nao da para
+// atribuir tremor a um dedo especifico, entao colorir dedo a dedo (como fazia
+// a versao anterior) seria inventar informacao que a luva nao tem.
+void desenhaMao(boolean conectado) {
   noStroke();
 
+  float intensidade = conectado ? norm01(tTs) : 0;
+  color corMao   = lerpColor(PELE, TREMOR_COR, intensidade);
+  color corPunho = lerpColor(PELE_CLARA, TREMOR_COR, intensidade * 0.7);
+  if (!conectado) { corMao = color(90, 90, 100); corPunho = color(105, 105, 115); }
+
   // Punho
-  fill(PELE_CLARA);
+  fill(corPunho);
   pushMatrix();
   translate(-100, 0, 0);
   box(55, 26, 68);
   popMatrix();
 
   // Palma
-  fill(PELE);
-  pushMatrix();
+  fill(corMao);
   box(145, 22, 100);
-  popMatrix();
 
-  // Dedos: posição Z na borda da palma, comprimento e canal de tremor
-  desenhaDedo(-36, 62, norm01(tTs));  // mínimo   <- Total
-  desenhaDedo(-12, 80, norm01(tZs));  // anelar   <- Z
-  desenhaDedo( 12, 86, norm01(tYs));  // médio    <- Y
-  desenhaDedo( 36, 74, norm01(tXs));  // indicador<- X
+  // Quatro dedos (indice 1..4 dos canais). O polegar vem depois, a parte.
+  float curva = radians(7 + intensidade * 22);
+  desenhaDedo(-36, 62, corMao, curva);   // mindinho
+  desenhaDedo(-12, 80, corMao, curva);   // nervo tras
+  desenhaDedo( 12, 86, corMao, curva);   // nervo frente
+  desenhaDedo( 36, 74, corMao, curva);   // indicador
 
-  // Polegar: 2 falanges, saindo da lateral da palma em diagonal
+  // Polegar: 2 falanges, saindo da lateral da palma em diagonal.
+  // (Antes ficava sempre cor de pele, destoando do resto da mao.)
   pushMatrix();
   translate(30, 0, 52);
   rotateY(radians(-48));
-  fill(PELE);
+  fill(corMao);
   float[] segPol = {34, 30};
   for (int s = 0; s < 2; s++) {
     rotateZ(radians(6));
@@ -203,13 +257,8 @@ void desenhaMao() {
   popMatrix();
 }
 
-// Um dedo com 3 falanges que se curvam levemente para baixo.
-// 'intensidade' (0-1) pinta o dedo de vermelho e aumenta a curvatura.
-void desenhaDedo(float baseZ, float comprimento, float intensidade) {
-  color cor = lerpColor(PELE, TREMOR_COR, intensidade);
-  float curva = radians(7 + intensidade * 22);
+void desenhaDedo(float baseZ, float comprimento, color cor, float curva) {
   float[] prop = {0.42, 0.32, 0.26};
-
   pushMatrix();
   translate(70, -1, baseZ);
   fill(cor);
@@ -223,53 +272,218 @@ void desenhaDedo(float baseZ, float comprimento, float intensidade) {
   popMatrix();
 }
 
-// ================= AUXILIARES =================
-float norm01(float v) {
-  return constrain(map(v, 0, T_MAX, 0, 1), 0, 1);
+// ============================================================================
+// HUD 2D
+// ============================================================================
+void desenhaHUD(boolean conectado) {
+  camera();
+  noLights();
+  hint(DISABLE_DEPTH_TEST);
+  textAlign(LEFT, BASELINE);
+
+  int x = 20, y = 28;
+
+  // --- conexao ---
+  if (!conectado) {
+    fill(255, 120, 60);
+    text("SEM DADOS - verifique o cabo ou o reset do ESP32", x, y);
+  } else {
+    fill(TEXTO_FRACO);
+    text("Conectado  " + linhasOk + " linhas" +
+         (linhasRuins > 0 ? "  (" + linhasRuins + " descartadas)" : ""), x, y);
+  }
+  y += 26;
+
+  // --- inclinacao ---
+  fill(TEXTO);
+  text("Roll  " + nf(rollS,  1, 1) + " graus", x, y);       y += 18;
+  text("Pitch " + nf(pitchS, 1, 1) + " graus", x, y);       y += 28;
+
+  // --- status do tremor ---
+  boolean temTremor = conectado && tTotal >= LIMIAR_TREMOR;
+  fill(temTremor ? TREMOR_COR : color(60, 255, 120));
+  text(temTremor ? "TREMOR ACIMA DO LIMIAR" : "Abaixo do limiar", x, y);
+  y += 20;
+
+  // --- estado do firmware ---
+  // A flag da terapia diz em qual fase do ciclo medir/tratar a luva esta.
+  if (terapiaAtiva) {
+    fill(COR_TERAPIA);
+    text("TERAPIA CR ATIVA", x, y);
+    y += 16;
+    fill(TEXTO_FRACO);
+    text("leitura congelada (motores ligados)", x, y);
+  } else {
+    fill(TEXTO_FRACO);
+    text("MEDINDO (motores parados)", x, y);
+    y += 16;
+    fill(TEXTO_FRACO);
+    text("leitura ao vivo", x, y);
+  }
+  y += 30;
+
+  // --- barras por eixo ---
+  fill(TEXTO_FRACO);
+  text("Amplitude do tremor por eixo do acelerometro (3,5-7 Hz)", x, y);
+  y += 8;
+  desenhaBarra("X", tXs, tX, COR_X,     x, y);       y += 24;
+  desenhaBarra("Y", tYs, tY, COR_Y,     x, y);       y += 24;
+  desenhaBarra("Z", tZs, tZ, COR_Z,     x, y);       y += 24;
+  desenhaBarra("|T|", tTs, tTotal, COR_TOTAL, x, y); y += 30;
+
+  fill(TEXTO_FRACO);
+  text("|T| = modulo dos tres eixos; e' ele que aciona a terapia.", x, y);
+  y += 16;
+  text("A luva tem um MPU so: mede a mao inteira, nao dedo a dedo.", x, y);
+
+  desenhaLegendaCanais();
+  desenhaGrafico();
+
+  hint(ENABLE_DEPTH_TEST);
 }
 
-// Interpola ângulos pelo caminho mais curto (trata a descontinuidade em ±180°)
-float suavizaAngulo(float atual, float alvo, float fator) {
-  float d = ((alvo - atual + 540) % 360) - 180;
-  return atual + d * fator;
+// Barra com marca do limiar. Mostra o valor cru (nao o suavizado) no texto,
+// para bater com o que o firmware realmente mandou.
+void desenhaBarra(String rotulo, float suave, float cru, color cor, int x, int y) {
+  final int LARG = 300, ALT = 14;
+  int bx = x + 52;
+
+  noStroke();
+  fill(38, 38, 56);
+  rect(bx, y, LARG, ALT, 3);
+
+  float w = map(constrain(suave, 0, T_MAX), 0, T_MAX, 0, LARG);
+  // Durante a terapia o valor esta congelado: barra mais apagada para nao
+  // passar a impressao de que continua sendo medido ao vivo.
+  fill(terapiaAtiva ? lerpColor(cor, FUNDO, 0.45) : cor);
+  rect(bx, y, w, ALT, 3);
+
+  stroke(255, 255, 255, 130);
+  strokeWeight(1);
+  float xLim = bx + map(LIMIAR_TREMOR, 0, T_MAX, 0, LARG);
+  line(xLim, y - 1, xLim, y + ALT + 1);
+  noStroke();
+
+  fill(TEXTO);
+  text(rotulo, x, y + ALT - 2);
+  fill(cru >= LIMIAR_TREMOR ? cor : TEXTO_FRACO);
+  text(nf(cru, 1, 3) + " g", bx + LARG + 10, y + ALT - 2);
 }
 
-void desenhaBarraEixo(String label, float val, color cor, int x, int y) {
-  float w = map(constrain(val, 0, T_MAX), 0, T_MAX, 0, 300);
-  fill(40, 40, 60); noStroke();
-  rect(x + 120, y, 300, 14, 3);
-  fill(cor);
-  rect(x + 120, y, w, 14, 3);
-  // Marca do limiar de detecção do firmware
-  stroke(255, 255, 255, 120);
-  float xLim = x + 120 + map(LIMIAR_TREMOR, 0, T_MAX, 0, 300);
-  line(xLim, y, xLim, y + 14);
-  fill(200); noStroke();
-  text(label + " " + nf(val, 1, 3), x, y + 12);
+// Os cinco canais existem no HARDWARE (um motor e um LED por posicao), mas o
+// firmware nao manda nada por canal: no Coordinated Reset todos pulsam, em
+// ordem sorteada. Por isso aqui eles aparecem como referencia de montagem, e
+// nao como cinco medidas independentes.
+void desenhaLegendaCanais() {
+  int x = width - 250, y = 40;
+  fill(TEXTO_FRACO);
+  text("Canais da luva (motor + LED)", x, y);
+  y += 20;
+  for (int i = 0; i < CANAIS.length; i++) {
+    if (terapiaAtiva) fill(COR_TERAPIA); else fill(90, 90, 110);
+    ellipse(x + 6, y - 4, 9, 9);
+    fill(terapiaAtiva ? TEXTO : TEXTO_FRACO);
+    text(CANAIS[i], x + 20, y);
+    y += 19;
+  }
+  y += 6;
+  fill(TEXTO_FRACO);
+  text(terapiaAtiva ? "pulsando em ordem sorteada" : "em repouso", x, y);
 }
 
-void desenhaGrafico(float[] hist, int gx, int gy, int gw, int gh, color cor) {
+void desenhaGrafico() {
+  int gx = 20, gy = height - 120, gw = width - 40, gh = 88;
+
+  fill(20, 20, 35);
+  stroke(50, 50, 80);
+  strokeWeight(1);
+  rect(gx, gy, gw, gh, 4);
+
+  // Faixas em que a terapia esteve ativa, ao fundo
+  noStroke();
+  fill(COR_TERAPIA, 30);
+  for (int i = 0; i < HIST; i++) {
+    int idx = (histIdx + i) % HIST;
+    if (histTerapia[idx]) rect(gx + map(i, 0, HIST, 0, gw), gy + 1, gw / (float) HIST + 1, gh - 2);
+  }
+
+  // Linha do limiar
+  stroke(255, 255, 255, 60);
+  float yLim = gy + gh - map(LIMIAR_TREMOR, 0, T_MAX, 0, gh);
+  line(gx, yLim, gx + gw, yLim);
+
+  desenhaSerie(histX, gx, gy, gw, gh, COR_X);
+  desenhaSerie(histY, gx, gy, gw, gh, COR_Y);
+  desenhaSerie(histZ, gx, gy, gw, gh, COR_Z);
+  desenhaSerie(histT, gx, gy, gw, gh, COR_TOTAL);
+
+  noStroke();
+  fill(TEXTO_FRACO);
+  text("Ultimos 4 s   (fundo azul = terapia ativa, linha branca = limiar)", gx + 4, gy - 6);
+
+  int lx = gx + 4, ly = gy + gh + 18;
+  fill(COR_X);     text("X",   lx,       ly);
+  fill(COR_Y);     text("Y",   lx + 30,  ly);
+  fill(COR_Z);     text("Z",   lx + 60,  ly);
+  fill(COR_TOTAL); text("|T|", lx + 90,  ly);
+  fill(TEXTO_FRACO);
+  text("escala 0 a " + nf(T_MAX, 1, 2) + " g", lx + 140, ly);
+}
+
+void desenhaSerie(float[] hist, int gx, int gy, int gw, int gh, color cor) {
   noFill();
   stroke(cor);
   strokeWeight(1.2);
   beginShape();
   for (int i = 0; i < HIST; i++) {
     int idx = (histIdx + i) % HIST;
-    float x = gx + map(i, 0, HIST, 0, gw);
-    float y = gy + gh - map(hist[idx], 0, T_MAX, 0, gh);
-    y = constrain(y, gy, gy + gh);
-    vertex(x, y);
+    float px = gx + map(i, 0, HIST, 0, gw);
+    float py = gy + gh - map(constrain(hist[idx], 0, T_MAX), 0, T_MAX, 0, gh);
+    vertex(px, py);
   }
   endShape();
+  strokeWeight(1);
 }
 
+void desenhaAvisoSemPorta() {
+  fill(255, 90, 90);
+  textAlign(CENTER, CENTER);
+  text("Nenhuma porta serial disponivel.\n\n" +
+       "Conecte o ESP32, feche o Monitor Serial do Arduino IDE\n" +
+       "e reinicie este sketch.",
+       width / 2, height / 2);
+  textAlign(LEFT, BASELINE);
+}
+
+// ============================================================================
+// AUXILIARES
+// ============================================================================
+float norm01(float v) {
+  return constrain(map(v, 0, T_MAX, 0, 1), 0, 1);
+}
+
+// Interpola angulos pelo caminho mais curto (trata a descontinuidade em +-180)
+float suavizaAngulo(float atual, float alvo, float fator) {
+  float d = ((alvo - atual + 540) % 360) - 180;
+  return atual + d * fator;
+}
+
+// ============================================================================
+// SERIAL  (roda na thread da serial - so toca no bloco protegido pelo lock)
+// ============================================================================
 void serialEvent(Serial p) {
   String linha = p.readStringUntil('\n');
   if (linha == null) return;
   linha = trim(linha);
+  if (linha.length() == 0) return;
+
   String[] v = split(linha, ',');
-  // Tolerante: 6 campos (firmware antigo) ou 7 (novo, com flag de terapia CR)
-  if (v.length < 6) return;
+  // O firmware manda 7 campos. Linhas com menos campos sao lixo de boot
+  // (mensagens de DEBUG, avisos de calibracao) ou pacote cortado.
+  if (v.length < 7) {
+    synchronized (trava) { sLinhasRuins++; }
+    return;
+  }
 
   float r  = float(v[0]);
   float pt = float(v[1]);
@@ -278,20 +492,31 @@ void serialEvent(Serial p) {
   float z  = float(v[4]);
   float t  = float(v[5]);
 
-  // float() do Processing devolve NaN em linha corrompida (não lança exceção).
-  // Um único NaN contaminaria a suavização para sempre — descarta a linha.
+  // float() do Processing devolve NaN em linha corrompida (nao lanca excecao).
+  // Um unico NaN contaminaria a suavizacao para sempre - descarta a linha.
   if (Float.isNaN(r) || Float.isNaN(pt) || Float.isNaN(x) ||
-      Float.isNaN(y) || Float.isNaN(z)  || Float.isNaN(t)) return;
+      Float.isNaN(y) || Float.isNaN(z)  || Float.isNaN(t)) {
+    synchronized (trava) { sLinhasRuins++; }
+    return;
+  }
 
-  roll = r;  pitch = pt;
-  tX = x;  tY = y;  tZ = z;  tTotal = t;
+  // A flag de terapia vem do firmware. Nao da mais para deduzi-la de
+  // "tTotal > 0": desde as correcoes o firmware manda a amplitude medida
+  // sempre, inclusive abaixo do limiar, entao tTotal e' quase sempre > 0.
+  boolean terapia = (trim(v[6]).equals("1"));
 
-  // 7º campo (opcional): 1 = terapia Coordinated Reset ativa
-  terapiaAtiva = (v.length >= 7) ? (int(trim(v[6])) == 1) : (tTotal > 0.0);
+  synchronized (trava) {
+    sRoll = r;  sPitch = pt;
+    sX = x;  sY = y;  sZ = z;  sT = t;
+    sTerapia = terapia;
+    sUltimaLinha = millis();
+    sLinhasOk++;
 
-  histX[histIdx]   = tX;
-  histY[histIdx]   = tY;
-  histZ[histIdx]   = tZ;
-  histAll[histIdx] = tTotal;
-  histIdx = (histIdx + 1) % HIST;
+    sHistX[sHistIdx] = x;
+    sHistY[sHistIdx] = y;
+    sHistZ[sHistIdx] = z;
+    sHistT[sHistIdx] = t;
+    sHistTerapia[sHistIdx] = terapia;
+    sHistIdx = (sHistIdx + 1) % HIST;
+  }
 }
