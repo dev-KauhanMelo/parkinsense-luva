@@ -270,6 +270,13 @@ curso (até 5 s) mais o reenchimento da janela (2,56 s).
 
 ---
 
+## Para apresentar
+
+O [Guia de apresentação](GUIA-APRESENTACAO.md) explica o projeto do zero: cada
+nome que aparece na tela do Processing, as ideias de física e matemática por
+trás da detecção, e o código inteiro parte por parte, ensinando o C++ conforme
+ele aparece. Escrito para quem nunca programou.
+
 ## Outras abordagens
 
 O [Coordinated Reset](ABORDAGEM-COORDINATED-RESET.md) é uma técnica diferente,
@@ -296,5 +303,6 @@ documentada e preservada caso seja retomada no futuro.
 sketch_tremor_FINAL222.ino          firmware do ESP32
 visualizacao/visuLuvinha/           visualização em Processing
 abrir-projeto.sh                    abre os dois de uma vez
+GUIA-APRESENTACAO.md                guia de estudo e apresentação
 ABORDAGEM-COORDINATED-RESET.md      abordagem alternativa (não adotada)
 ```
